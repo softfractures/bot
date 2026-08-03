@@ -19,7 +19,11 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
-OWNER_ID = "436550942029250570"  # your user ID
+# Multiple owners – add all user IDs that should have command access
+OWNER_IDS = [
+    "436550942029250570",  # your main account
+    "1505100446891773962"  # added new owner
+]
 
 MIN_REPLY_DELAY = 4.0
 MAX_REPLY_DELAY = 8.0
@@ -266,11 +270,9 @@ async def process_worker():
 # RESTORE VOICE CHANNELS AFTER RECONNECT
 # --------------------------------------------
 async def restore_voice_channels():
-    """Rejoin all voice channels that were active before a disconnect."""
     global current_ws, voice_channels
     if not persistent_voice_channels:
         return
-    
     log.info(f"Restoring {len(persistent_voice_channels)} voice channels...")
     for guild_id, channel_id in list(persistent_voice_channels.items()):
         try:
@@ -349,7 +351,7 @@ async def handle_command(msg):
                 }
             }))
             voice_channels[guild_id] = vc_id
-            persistent_voice_channels[guild_id] = vc_id  # Save for reconnection
+            persistent_voice_channels[guild_id] = vc_id
             log.info(f"Voice join sent to guild {guild_id}, channel {vc_id}")
             await send_reply(channel_id, msg_id, f"dołączono do <#{vc_id}> w serwerze {guild_id} 💀")
         except Exception as e:
@@ -383,7 +385,7 @@ async def handle_command(msg):
                 }))
                 del voice_channels[guild_id]
                 if guild_id in persistent_voice_channels:
-                    del persistent_voice_channels[guild_id]  # Remove from persistence
+                    del persistent_voice_channels[guild_id]
                 log.info(f"Voice leave sent for guild {guild_id}")
                 await send_reply(channel_id, msg_id, f"opuszczono voice w serwerze {guild_id} 😎")
             except Exception as e:
@@ -420,15 +422,20 @@ async def handle_message(msg):
     content = msg.get("content", "")
     author_id = str(msg["author"]["id"])
     
+    # DEBUG: Log message details
+    log.info(f"handle_message: author={author_id}, content='{content[:30]}'")
+
+    # If it's a command (starts with .), only process if author is in OWNER_IDS
     if content.startswith("."):
-        if author_id == OWNER_ID or (self_user_id and author_id == self_user_id):
+        if author_id in OWNER_IDS or (self_user_id and author_id == self_user_id):
             log.info(f"Processing command from owner: {content}")
             await handle_command(msg)
         else:
             log.info(f"Ignoring command from {author_id} (not owner)")
         return
 
-    if author_id == OWNER_ID or (self_user_id and author_id == self_user_id):
+    # Ignore own non-command messages (if author is in OWNER_IDS or self)
+    if author_id in OWNER_IDS or (self_user_id and author_id == self_user_id):
         return
 
     # --- AI reply for others ---
@@ -474,19 +481,24 @@ async def handle_message(msg):
         await asyncio.sleep(CHUNK_DELAY + random.uniform(0, 0.5))
 
 # --------------------------------------------
-# FILTER
+# FILTER (Self messages only if command, others only if mention/reply)
 # --------------------------------------------
 async def filter_and_queue(msg):
     global self_user_id
     author_id = str(msg["author"]["id"])
     content = msg.get("content", "")
     
-    if author_id == OWNER_ID or (self_user_id and author_id == self_user_id):
+    # DEBUG: Log raw message
+    log.info(f"filter_and_queue: author={author_id}, content='{content[:30]}'")
+
+    # If from owner (any in OWNER_IDS), only queue commands
+    if author_id in OWNER_IDS or (self_user_id and author_id == self_user_id):
         if content.startswith("."):
             log.info(f"Queueing command from owner: {content}")
             await message_queue.put(msg)
         return
 
+    # For others, process only if DM/group or mention/reply
     channel_type = msg.get("channel_type")
     if channel_type in ("DM", "GROUP_DM"):
         log.info(f"DM from {msg['author']['username']} -> queue")
@@ -505,24 +517,21 @@ async def filter_and_queue(msg):
         await message_queue.put(msg)
 
 # --------------------------------------------
-# VOICE KEEP-ALIVE
+# VOICE KEEP-ALIVE (with persistent rejoin)
 # --------------------------------------------
 async def voice_keepalive():
-    """Periodically send voice state updates for all connected guilds."""
     global current_ws, voice_channels, persistent_voice_channels
     while True:
         await asyncio.sleep(60)
         
-        # If we have no channels, skip
         if not voice_channels and not persistent_voice_channels:
             continue
         
-        # If we're disconnected, skip
         if current_ws is None:
             log.warning("Voice keepalive: WebSocket is None, skipping")
             continue
         
-        # Re-join any persistent channels that aren't in voice_channels
+        # Re-join any persistent channels not currently in voice_channels
         for guild_id, channel_id in list(persistent_voice_channels.items()):
             if guild_id not in voice_channels:
                 log.info(f"Voice keepalive: re-joining guild {guild_id} -> {channel_id}")
@@ -611,10 +620,10 @@ async def listen():
             }))
             log.info("Identify sent (no intents)")
         
-        # Start voice keepalive as a background task
+        # Start voice keepalive background task
         keepalive_task = asyncio.create_task(voice_keepalive())
         
-        # Restore voice channels if we have any
+        # Restore voice channels if any were previously connected
         await restore_voice_channels()
         
         while True:
@@ -654,6 +663,7 @@ async def listen():
             except Exception as e:
                 log.exception("Loop error")
         
+        # Cancel keepalive when we exit the loop
         keepalive_task.cancel()
 
 # --------------------------------------------
