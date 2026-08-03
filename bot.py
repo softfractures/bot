@@ -142,7 +142,8 @@ last_seq = None
 message_counter = 0
 last_message_time = 0
 current_ws = None
-voice_channels = {}
+voice_channels = {}              # current active voice connections (guild_id -> channel_id)
+persistent_voice_channels = {}   # persistent storage across reconnects (guild_id -> channel_id)
 
 guild_histories = {}
 channel_history_cache = {}
@@ -262,10 +263,37 @@ async def process_worker():
             await asyncio.sleep(random.uniform(MIN_REPLY_DELAY, MAX_REPLY_DELAY))
 
 # --------------------------------------------
+# RESTORE VOICE CHANNELS AFTER RECONNECT
+# --------------------------------------------
+async def restore_voice_channels():
+    """Rejoin all voice channels that were active before a disconnect."""
+    global current_ws, voice_channels
+    if not persistent_voice_channels:
+        return
+    
+    log.info(f"Restoring {len(persistent_voice_channels)} voice channels...")
+    for guild_id, channel_id in list(persistent_voice_channels.items()):
+        try:
+            if current_ws:
+                await current_ws.send(json.dumps({
+                    "op": 4,
+                    "d": {
+                        "guild_id": guild_id,
+                        "channel_id": channel_id,
+                        "self_mute": False,
+                        "self_deaf": False
+                    }
+                }))
+                voice_channels[guild_id] = channel_id
+                log.info(f"Restored voice in guild {guild_id} -> {channel_id}")
+        except Exception as e:
+            log.warning(f"Failed to restore voice for guild {guild_id}: {e}")
+
+# --------------------------------------------
 # VOICE COMMANDS HANDLER
 # --------------------------------------------
 async def handle_command(msg):
-    global current_ws, voice_channels
+    global current_ws, voice_channels, persistent_voice_channels
     content = msg.get("content", "")
     channel_id = msg["channel_id"]
     current_guild = msg.get("guild_id")
@@ -321,6 +349,7 @@ async def handle_command(msg):
                 }
             }))
             voice_channels[guild_id] = vc_id
+            persistent_voice_channels[guild_id] = vc_id  # Save for reconnection
             log.info(f"Voice join sent to guild {guild_id}, channel {vc_id}")
             await send_reply(channel_id, msg_id, f"dołączono do <#{vc_id}> w serwerze {guild_id} 💀")
         except Exception as e:
@@ -353,6 +382,8 @@ async def handle_command(msg):
                     }
                 }))
                 del voice_channels[guild_id]
+                if guild_id in persistent_voice_channels:
+                    del persistent_voice_channels[guild_id]  # Remove from persistence
                 log.info(f"Voice leave sent for guild {guild_id}")
                 await send_reply(channel_id, msg_id, f"opuszczono voice w serwerze {guild_id} 😎")
             except Exception as e:
@@ -389,10 +420,6 @@ async def handle_message(msg):
     content = msg.get("content", "")
     author_id = str(msg["author"]["id"])
     
-    # DEBUG: Log message details
-    log.info(f"handle_message: author={author_id}, content='{content[:30]}'")
-
-    # If it's a command (starts with .), only process if I sent it
     if content.startswith("."):
         if author_id == OWNER_ID or (self_user_id and author_id == self_user_id):
             log.info(f"Processing command from owner: {content}")
@@ -401,7 +428,6 @@ async def handle_message(msg):
             log.info(f"Ignoring command from {author_id} (not owner)")
         return
 
-    # Ignore own non-command messages
     if author_id == OWNER_ID or (self_user_id and author_id == self_user_id):
         return
 
@@ -455,17 +481,12 @@ async def filter_and_queue(msg):
     author_id = str(msg["author"]["id"])
     content = msg.get("content", "")
     
-    # DEBUG: Log raw message
-    log.info(f"filter_and_queue: author={author_id}, content='{content[:30]}'")
-
-    # If from owner, only queue commands
     if author_id == OWNER_ID or (self_user_id and author_id == self_user_id):
         if content.startswith("."):
             log.info(f"Queueing command from owner: {content}")
             await message_queue.put(msg)
         return
 
-    # For others, process only if DM/group or mention/reply
     channel_type = msg.get("channel_type")
     if channel_type in ("DM", "GROUP_DM"):
         log.info(f"DM from {msg['author']['username']} -> queue")
@@ -486,15 +507,43 @@ async def filter_and_queue(msg):
 # --------------------------------------------
 # VOICE KEEP-ALIVE
 # --------------------------------------------
-async def voice_keepalive(ws):
-    global voice_channels
+async def voice_keepalive():
+    """Periodically send voice state updates for all connected guilds."""
+    global current_ws, voice_channels, persistent_voice_channels
     while True:
         await asyncio.sleep(60)
-        if not voice_channels:
+        
+        # If we have no channels, skip
+        if not voice_channels and not persistent_voice_channels:
             continue
+        
+        # If we're disconnected, skip
+        if current_ws is None:
+            log.warning("Voice keepalive: WebSocket is None, skipping")
+            continue
+        
+        # Re-join any persistent channels that aren't in voice_channels
+        for guild_id, channel_id in list(persistent_voice_channels.items()):
+            if guild_id not in voice_channels:
+                log.info(f"Voice keepalive: re-joining guild {guild_id} -> {channel_id}")
+                try:
+                    await current_ws.send(json.dumps({
+                        "op": 4,
+                        "d": {
+                            "guild_id": guild_id,
+                            "channel_id": channel_id,
+                            "self_mute": False,
+                            "self_deaf": False
+                        }
+                    }))
+                    voice_channels[guild_id] = channel_id
+                except Exception as e:
+                    log.warning(f"Voice keepalive re-join error for {guild_id}: {e}")
+        
+        # Send keepalive updates for all active channels
         for guild_id, channel_id in list(voice_channels.items()):
             try:
-                await ws.send(json.dumps({
+                await current_ws.send(json.dumps({
                     "op": 4,
                     "d": {
                         "guild_id": guild_id,
@@ -540,7 +589,6 @@ async def listen():
             }))
             log.info("Resume sent")
         else:
-            # --- IDENTIFY WITHOUT INTENTS (selfbot fix) ---
             await ws.send(json.dumps({
                 "op": 2,
                 "d": {
@@ -557,14 +605,17 @@ async def listen():
                         "$system_locale": "en-US",
                         "$browser_version": "120.0.6099.216"
                     },
-                    # removed "intents" entirely – selfbots don't need it
                     "large_threshold": 250,
                     "compress": False
                 }
             }))
             log.info("Identify sent (no intents)")
         
-        keepalive_task = asyncio.create_task(voice_keepalive(ws))
+        # Start voice keepalive as a background task
+        keepalive_task = asyncio.create_task(voice_keepalive())
+        
+        # Restore voice channels if we have any
+        await restore_voice_channels()
         
         while True:
             try:
@@ -580,9 +631,9 @@ async def listen():
                         session_id = d["session_id"]
                         resume_gateway_url = d["resume_gateway_url"]
                         log.info(f"Logged in as {d['user']['username']} (ID: {self_user_id})")
+                        # Restore voice after ready
+                        await restore_voice_channels()
                     elif t == "MESSAGE_CREATE":
-                        # DEBUG: Log the full message payload once
-                        log.debug(f"MESSAGE_CREATE payload: {json.dumps(d, indent=2)[:500]}")
                         await filter_and_queue(d)
                     if payload.get("s"):
                         last_seq = payload["s"]
