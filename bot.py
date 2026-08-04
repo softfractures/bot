@@ -28,10 +28,10 @@ OWNER_IDS = [
 ]
 
 # Spontaneous messages settings
-SPONTANEOUS_CHANCE = 0.03          # 3% chance per minute
-SPONTANEOUS_COOLDOWN = 180         # 3 minutes cooldown
-SPONTANEOUS_CHECK_INTERVAL = 60    # Check every minute
-SPONTANEOUS_CHANNEL_ID = "1458080496369139849"   # <-- ONLY this channel gets spontaneous messages
+SPONTANEOUS_CHANCE = 0.03
+SPONTANEOUS_COOLDOWN = 180
+SPONTANEOUS_CHECK_INTERVAL = 60
+SPONTANEOUS_CHANNEL_ID = "1458080496369139849"
 
 # Faster delays
 MIN_REPLY_DELAY = 2.0
@@ -76,7 +76,6 @@ LATEST_BUILD, LATEST_VERSION = fetch_latest_build_info()
 # --------------------------------------------
 genai.configure(api_key=GEMINI_API_KEY)
 
-# Default system prompt
 DEFAULT_SYSTEM_PROMPT = (
 "jesteś wulgarnym agresywnym botem discord"
 "piszesz tylko małymi literami"
@@ -254,7 +253,7 @@ async def build_context(channel_id, current_msg, guild_id=None):
     return "\n".join(lines)
 
 # --------------------------------------------
-# SPONTANEOUS MESSAGES (NOW INSULTS WITH DISPLAY NAME)
+# SPONTANEOUS MESSAGES (unchanged)
 # --------------------------------------------
 SPONTANEOUS_PROMPTS = [
     "napisz wulgarna, agresywna, krotka wiadomosc obrażajaca użytkownika {username}. maksymalnie 1-2 zdania. bez emotek. uzywaj wulgaryzmow.",
@@ -279,7 +278,6 @@ async def send_spontaneous_message():
     if random.random() > SPONTANEOUS_CHANCE:
         return
     
-    # 1. Fetch recent messages to pick a random user
     target_user_id = None
     target_display_name = None
     try:
@@ -294,17 +292,13 @@ async def send_spontaneous_message():
                     continue
                 if m["author"].get("bot", False):
                     continue
-                # Use global_name (display name) if available, otherwise username
                 display_name = m["author"].get("global_name") or m["author"].get("username", "user")
                 users.append((m["author"]["id"], display_name))
             if users:
                 target_user_id, target_display_name = random.choice(users)
-        else:
-            log.warning(f"Could not fetch messages for spontaneous ping: {resp.status_code}")
     except Exception as e:
         log.warning(f"Failed to fetch users for spontaneous message: {e}")
     
-    # If we couldn't pick a user, fallback to generic random message
     if not target_user_id:
         log.info("No users found, using generic message")
         try:
@@ -321,7 +315,6 @@ async def send_spontaneous_message():
             log.exception("Failed to send generic spontaneous message")
         return
     
-    # 2. Generate an insult targeting the chosen user
     try:
         prompt_template = random.choice(SPONTANEOUS_PROMPTS)
         prompt = prompt_template.format(username=target_display_name)
@@ -332,10 +325,7 @@ async def send_spontaneous_message():
         insult = (reply.text or "").strip()
         if not insult:
             return
-        
-        # Build final message: insult + ping
         final_msg = f"{insult} <@{target_user_id}>"
-        
         log.info(f"Sending spontaneous insult to {target_display_name} in {channel_id}: {final_msg}")
         await send_typing(channel_id)
         await asyncio.sleep(1.5)
@@ -360,30 +350,46 @@ async def update_prompt(new_prompt):
     return True
 
 # --------------------------------------------
-# PROFILE CHANGE FUNCTIONS
+# PROFILE CHANGE FUNCTIONS (AVATAR + DISPLAY NAME)
 # --------------------------------------------
-async def change_avatar(image_data: bytes) -> bool:
-    """Change the user's avatar using image data."""
-    b64 = base64.b64encode(image_data).decode()
-    mime = "image/png"  # default, but we could detect
-    # Try to guess mime from magic bytes (simplified)
+async def change_avatar(image_data: bytes):
+    if len(image_data) > 256 * 1024:
+        return False, "Obraz jest za duży (max 256 KB)"
     if image_data.startswith(b'\xff\xd8'):
         mime = "image/jpeg"
     elif image_data.startswith(b'\x89PNG'):
         mime = "image/png"
     elif image_data.startswith(b'GIF'):
         mime = "image/gif"
-    payload = {
-        "avatar": f"data:{mime};base64,{b64}"
-    }
+    else:
+        mime = "image/png"
+    b64 = base64.b64encode(image_data).decode()
+    payload = {"avatar": f"data:{mime};base64,{b64}"}
     resp = await api_request("PATCH", "https://discord.com/api/v9/users/@me", json=payload)
-    return resp.status_code == 200
+    if resp.status_code == 200:
+        return True, "Avatar zmieniony"
+    else:
+        try:
+            error_data = resp.json()
+            error_msg = error_data.get('message', 'Brak szczegółów')
+        except:
+            error_msg = resp.text[:100]
+        return False, f"Nie udało się zmienić (status {resp.status_code}): {error_msg}"
 
-async def change_username(new_name: str) -> bool:
-    """Change the user's display name (username)."""
-    payload = {"username": new_name}
+async def change_display_name(new_display: str):
+    if len(new_display) < 2 or len(new_display) > 32:
+        return False, "Display name must be 2-32 characters"
+    payload = {"global_name": new_display}
     resp = await api_request("PATCH", "https://discord.com/api/v9/users/@me", json=payload)
-    return resp.status_code == 200
+    if resp.status_code == 200:
+        return True, f"Zmieniono display name na: {new_display}"
+    else:
+        try:
+            error_data = resp.json()
+            error_msg = error_data.get('message', 'Brak szczegółów')
+        except:
+            error_msg = resp.text[:100]
+        return False, f"Nie udało się zmienić display name (status {resp.status_code}): {error_msg}"
 
 # --------------------------------------------
 # MESSAGE QUEUE
@@ -444,7 +450,7 @@ async def restore_voice_channels():
             log.warning(f"Failed to restore voice for guild {guild_id}: {e}")
 
 # --------------------------------------------
-# VOICE COMMANDS HANDLER (EXTENDED)
+# VOICE COMMANDS HANDLER (UPDATED – .name removed)
 # --------------------------------------------
 async def handle_command(msg):
     global current_ws, voice_channels, persistent_voice_channels, current_system_prompt, model
@@ -496,11 +502,9 @@ async def handle_command(msg):
             await send_reply(channel_id, msg_id, "nie udalo sie przywrocic promptu")
         return
 
-    # -------------------- NEW: AVATAR CHANGE --------------------
+    # -------------------- AVATAR CHANGE --------------------
     if cmd == ".avatar":
-        # Check if there's an attachment or a URL
         image_data = None
-        # 1. Check attachments
         if msg.get("attachments"):
             att = msg["attachments"][0]
             url = att["url"]
@@ -513,7 +517,6 @@ async def handle_command(msg):
                 log.exception("Failed to download attachment")
                 await send_reply(channel_id, msg_id, "nie mogę pobrać załącznika")
                 return
-        # 2. Check if a URL was provided
         elif len(parts) >= 2:
             img_url = parts[1]
             try:
@@ -533,27 +536,24 @@ async def handle_command(msg):
             await send_reply(channel_id, msg_id, "nie udało się pobrać obrazu")
             return
 
-        success = await change_avatar(image_data)
+        success, message = await change_avatar(image_data)
         if success:
-            await send_reply(channel_id, msg_id, "avatar zmieniony 🖼️")
+            await send_reply(channel_id, msg_id, message)
         else:
-            await send_reply(channel_id, msg_id, "nie udało się zmienić avatara (rate limit? format?)")
+            await send_reply(channel_id, msg_id, f"nie udało się zmienić avatara: {message}")
         return
 
-    # -------------------- NEW: USERNAME CHANGE --------------------
-    if cmd == ".name":
+    # -------------------- DISPLAY NAME CHANGE (global_name) --------------------
+    if cmd == ".display":
         if len(parts) < 2:
-            await send_reply(channel_id, msg_id, "użycie: .name <nowa_nazwa>")
+            await send_reply(channel_id, msg_id, "użycie: .display <nowy_display_name>")
             return
-        new_name = " ".join(parts[1:])
-        if len(new_name) < 2 or len(new_name) > 32:
-            await send_reply(channel_id, msg_id, "nazwa musi mieć 2-32 znaki")
-            return
-        success = await change_username(new_name)
+        new_display = " ".join(parts[1:])
+        success, message = await change_display_name(new_display)
         if success:
-            await send_reply(channel_id, msg_id, f"zmieniono nazwę na: {new_name}")
+            await send_reply(channel_id, msg_id, message)
         else:
-            await send_reply(channel_id, msg_id, "nie udało się zmienić nazwy (rate limit?)")
+            await send_reply(channel_id, msg_id, f"nie udało się zmienić display name: {message}")
         return
 
     # --- VOICE COMMANDS ---
@@ -659,11 +659,9 @@ async def handle_message(msg):
     author_id = str(msg["author"]["id"])
     is_bot = msg.get("author", {}).get("bot", False)
     
-    # Ignore bots
     if is_bot:
         return
 
-    # If it's a command (starts with .), only process if author is in OWNER_IDS
     if content.startswith("."):
         if author_id in OWNER_IDS or (self_user_id and author_id == self_user_id):
             log.info(f"Processing command from owner: {content}")
@@ -676,7 +674,6 @@ async def handle_message(msg):
     msg_id = msg["id"]
     guild_id = msg.get("guild_id")
 
-    # Check if it's a mention or reply to self
     mentioned = any(m["id"] == self_user_id for m in msg.get("mentions", []))
     replied = False
     if msg.get("referenced_message"):
@@ -687,11 +684,9 @@ async def handle_message(msg):
     channel_type = msg.get("channel_type")
     is_dm = channel_type in ("DM", "GROUP_DM")
     
-    # Only respond if mentioned, replied to, or DM
     if not (mentioned or replied or is_dm):
         return
 
-    # Faster typing & thinking
     await asyncio.sleep(random.uniform(0.5, 1.5))
     await send_typing(channel_id)
     await asyncio.sleep(random.uniform(0.3, 0.6))
@@ -738,23 +733,19 @@ async def filter_and_queue(msg):
     content = msg.get("content", "")
     is_bot = msg.get("author", {}).get("bot", False)
     
-    # Track active channels
     channel_id = msg.get("channel_id")
     if channel_id and not is_bot:
         active_channels.add(channel_id)
     
-    # Ignore bots
     if is_bot:
         return
 
-    # Handle commands: only from owners
     if content.startswith("."):
         if author_id in OWNER_IDS or (self_user_id and author_id == self_user_id):
             log.info(f"Queueing command from owner: {content}")
             await message_queue.put(msg)
         return
 
-    # Non‑command messages: queue if it's a DM/group DM or mention/reply to self
     channel_type = msg.get("channel_type")
     if channel_type in ("DM", "GROUP_DM"):
         log.info(f"DM from {msg['author']['username']} -> queue")
