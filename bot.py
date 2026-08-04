@@ -5,6 +5,8 @@ import logging
 import random
 import time
 import base64
+import io
+import aiohttp
 import google.generativeai as genai
 from dotenv import load_dotenv
 import websockets
@@ -358,6 +360,32 @@ async def update_prompt(new_prompt):
     return True
 
 # --------------------------------------------
+# PROFILE CHANGE FUNCTIONS
+# --------------------------------------------
+async def change_avatar(image_data: bytes) -> bool:
+    """Change the user's avatar using image data."""
+    b64 = base64.b64encode(image_data).decode()
+    mime = "image/png"  # default, but we could detect
+    # Try to guess mime from magic bytes (simplified)
+    if image_data.startswith(b'\xff\xd8'):
+        mime = "image/jpeg"
+    elif image_data.startswith(b'\x89PNG'):
+        mime = "image/png"
+    elif image_data.startswith(b'GIF'):
+        mime = "image/gif"
+    payload = {
+        "avatar": f"data:{mime};base64,{b64}"
+    }
+    resp = await api_request("PATCH", "https://discord.com/api/v9/users/@me", json=payload)
+    return resp.status_code == 200
+
+async def change_username(new_name: str) -> bool:
+    """Change the user's display name (username)."""
+    payload = {"username": new_name}
+    resp = await api_request("PATCH", "https://discord.com/api/v9/users/@me", json=payload)
+    return resp.status_code == 200
+
+# --------------------------------------------
 # MESSAGE QUEUE
 # --------------------------------------------
 message_queue = asyncio.Queue()
@@ -416,7 +444,7 @@ async def restore_voice_channels():
             log.warning(f"Failed to restore voice for guild {guild_id}: {e}")
 
 # --------------------------------------------
-# VOICE COMMANDS HANDLER
+# VOICE COMMANDS HANDLER (EXTENDED)
 # --------------------------------------------
 async def handle_command(msg):
     global current_ws, voice_channels, persistent_voice_channels, current_system_prompt, model
@@ -433,11 +461,13 @@ async def handle_command(msg):
     cmd = parts[0].lower()
     log.info(f"Command: {cmd} from guild {current_guild}, channel {channel_id}")
 
+    # --- TEST ---
     if cmd == ".test" or cmd == ".ping":
         status = "ws: ok" if current_ws else "ws: None"
         await send_reply(channel_id, msg_id, f"bot żyje, {status}")
         return
 
+    # --- SERVERS ---
     if cmd == ".servers":
         if voice_channels:
             lines = ["głosowe:"] + [f"{gid} -> {cid}" for gid, cid in voice_channels.items()]
@@ -446,6 +476,7 @@ async def handle_command(msg):
             await send_reply(channel_id, msg_id, "nie jestem w żadnym kanale głosowym")
         return
 
+    # --- PROMPT ---
     if cmd == ".prompt":
         if len(parts) > 1:
             new_prompt = " ".join(parts[1:])
@@ -457,6 +488,7 @@ async def handle_command(msg):
             await send_reply(channel_id, msg_id, f"obecny prompt: {current_system_prompt[:200]}...")
         return
 
+    # --- RESET PROMPT ---
     if cmd == ".resetprompt":
         if await update_prompt(DEFAULT_SYSTEM_PROMPT):
             await send_reply(channel_id, msg_id, "przywrocono domyslny prompt")
@@ -464,6 +496,67 @@ async def handle_command(msg):
             await send_reply(channel_id, msg_id, "nie udalo sie przywrocic promptu")
         return
 
+    # -------------------- NEW: AVATAR CHANGE --------------------
+    if cmd == ".avatar":
+        # Check if there's an attachment or a URL
+        image_data = None
+        # 1. Check attachments
+        if msg.get("attachments"):
+            att = msg["attachments"][0]
+            url = att["url"]
+            try:
+                async with aiohttp.ClientSession() as sess:
+                    async with sess.get(url) as resp:
+                        if resp.status == 200:
+                            image_data = await resp.read()
+            except Exception as e:
+                log.exception("Failed to download attachment")
+                await send_reply(channel_id, msg_id, "nie mogę pobrać załącznika")
+                return
+        # 2. Check if a URL was provided
+        elif len(parts) >= 2:
+            img_url = parts[1]
+            try:
+                async with aiohttp.ClientSession() as sess:
+                    async with sess.get(img_url) as resp:
+                        if resp.status == 200:
+                            image_data = await resp.read()
+            except Exception as e:
+                log.exception("Failed to download image from URL")
+                await send_reply(channel_id, msg_id, "nie mogę pobrać obrazu z podanego URL")
+                return
+        else:
+            await send_reply(channel_id, msg_id, "użyj: .avatar (z załącznikiem) lub .avatar <url_obrazu>")
+            return
+
+        if image_data is None:
+            await send_reply(channel_id, msg_id, "nie udało się pobrać obrazu")
+            return
+
+        success = await change_avatar(image_data)
+        if success:
+            await send_reply(channel_id, msg_id, "avatar zmieniony 🖼️")
+        else:
+            await send_reply(channel_id, msg_id, "nie udało się zmienić avatara (rate limit? format?)")
+        return
+
+    # -------------------- NEW: USERNAME CHANGE --------------------
+    if cmd == ".name":
+        if len(parts) < 2:
+            await send_reply(channel_id, msg_id, "użycie: .name <nowa_nazwa>")
+            return
+        new_name = " ".join(parts[1:])
+        if len(new_name) < 2 or len(new_name) > 32:
+            await send_reply(channel_id, msg_id, "nazwa musi mieć 2-32 znaki")
+            return
+        success = await change_username(new_name)
+        if success:
+            await send_reply(channel_id, msg_id, f"zmieniono nazwę na: {new_name}")
+        else:
+            await send_reply(channel_id, msg_id, "nie udało się zmienić nazwy (rate limit?)")
+        return
+
+    # --- VOICE COMMANDS ---
     if current_ws is None:
         await send_reply(channel_id, msg_id, "websocket nieaktywny, spróbuj ponownie za chwilę")
         return
