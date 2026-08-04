@@ -25,6 +25,12 @@ OWNER_IDS = [
     "1505100446891773962"
 ]
 
+# Spontaneous messages settings
+SPONTANEOUS_CHANCE = 0.03          # 3% chance per minute
+SPONTANEOUS_COOLDOWN = 180         # 3 minutes cooldown
+SPONTANEOUS_CHECK_INTERVAL = 60    # Check every minute
+SPONTANEOUS_CHANNEL_ID = "1458080496369139849"   # <-- ONLY this channel gets spontaneous messages
+
 # Faster delays
 MIN_REPLY_DELAY = 2.0
 MAX_REPLY_DELAY = 4.0
@@ -32,11 +38,6 @@ CHUNK_DELAY = 0.5
 MAX_MESSAGES_PER_MINUTE = 5
 HISTORY_CACHE_TTL = 60
 MAX_HISTORY_PER_GUILD = 50
-
-# Spontaneous messages settings
-SPONTANEOUS_CHANCE = 0.03  # 3% chance per minute to send spontaneous message
-SPONTANEOUS_COOLDOWN = 180  # 3 minutes cooldown between spontaneous messages
-SPONTANEOUS_CHECK_INTERVAL = 60  # Check every minute
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("stealth-selfbot")
@@ -180,7 +181,7 @@ current_ws = None
 voice_channels = {}
 persistent_voice_channels = {}
 last_spontaneous_time = 0
-active_channels = set()  # Track active channels for spontaneous messages
+active_channels = set()
 
 guild_histories = {}
 channel_history_cache = {}
@@ -251,7 +252,7 @@ async def build_context(channel_id, current_msg, guild_id=None):
     return "\n".join(lines)
 
 # --------------------------------------------
-# SPONTANEOUS MESSAGES
+# SPONTANEOUS MESSAGES (ONLY TO SPECIFIC CHANNEL, WITH PING)
 # --------------------------------------------
 SPONTANEOUS_PROMPTS = [
     "napisz losowa wulgarna wiadomosc bez powodu",
@@ -264,7 +265,9 @@ SPONTANEOUS_PROMPTS = [
 async def send_spontaneous_message():
     global last_spontaneous_time
     
-    if not active_channels:
+    channel_id = SPONTANEOUS_CHANNEL_ID
+    if not channel_id:
+        log.warning("No spontaneous channel ID set, skipping.")
         return
     
     now = time.time()
@@ -274,23 +277,52 @@ async def send_spontaneous_message():
     if random.random() > SPONTANEOUS_CHANCE:
         return
     
-    # Pick a random active channel
-    channel_id = random.choice(list(active_channels))
+    # 1. Fetch recent messages from the channel to pick a random user
+    ping = None
+    try:
+        # Use the session directly to fetch without cache
+        url = f"https://discord.com/api/v9/channels/{channel_id}/messages?limit=20"
+        headers = get_dynamic_headers()
+        resp = await asyncio.to_thread(session.get, url, headers=headers)
+        if resp.status_code == 200:
+            msgs = resp.json()
+            users = []
+            for m in msgs:
+                if m["author"]["id"] == self_user_id:
+                    continue
+                if m["author"].get("bot", False):
+                    continue
+                users.append(m["author"]["id"])
+            if users:
+                random_user_id = random.choice(users)
+                ping = f"<@{random_user_id}>"
+        else:
+            log.warning(f"Could not fetch messages for spontaneous ping: {resp.status_code}")
+    except Exception as e:
+        log.warning(f"Failed to fetch users for spontaneous message: {e}")
     
-    # Generate spontaneous message using AI
+    # 2. Generate the AI message
     try:
         prompt = random.choice(SPONTANEOUS_PROMPTS)
         reply = model.generate_content(prompt)
-        if reply.candidates:
-            msg = (reply.text or "").strip()
-            if msg:
-                log.info(f"Sending spontaneous message to channel {channel_id}: {msg}")
-                await send_typing(channel_id)
-                await asyncio.sleep(1.5)
-                await send_message(channel_id, msg)
-                last_spontaneous_time = now
+        if not reply.candidates:
+            log.warning("Gemini blocked spontaneous message.")
+            return
+        msg = (reply.text or "").strip()
+        if not msg:
+            return
+        
+        # Append ping if we have one
+        if ping:
+            msg = f"{msg} {ping}"
+        
+        log.info(f"Sending spontaneous message to {channel_id}: {msg}")
+        await send_typing(channel_id)
+        await asyncio.sleep(1.5)
+        await send_message(channel_id, msg)
+        last_spontaneous_time = now
     except Exception as e:
-        log.exception("Failed to generate spontaneous message")
+        log.exception("Failed to generate/send spontaneous message")
 
 async def spontaneous_loop():
     """Background task that periodically checks if bot should send spontaneous messages"""
@@ -399,14 +431,12 @@ async def handle_command(msg):
 
     if cmd == ".prompt":
         if len(parts) > 1:
-            # Update prompt
             new_prompt = " ".join(parts[1:])
             if await update_prompt(new_prompt):
                 await send_reply(channel_id, msg_id, f"zmieniono prompt na: {new_prompt[:100]}...")
             else:
                 await send_reply(channel_id, msg_id, "nie udalo sie zmienic promptu")
         else:
-            # Show current prompt
             await send_reply(channel_id, msg_id, f"obecny prompt: {current_system_prompt[:200]}...")
         return
 
