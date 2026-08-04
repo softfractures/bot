@@ -252,14 +252,14 @@ async def build_context(channel_id, current_msg, guild_id=None):
     return "\n".join(lines)
 
 # --------------------------------------------
-# SPONTANEOUS MESSAGES (ONLY TO SPECIFIC CHANNEL, WITH PING)
+# SPONTANEOUS MESSAGES (NOW INSULTS WITH DISPLAY NAME)
 # --------------------------------------------
 SPONTANEOUS_PROMPTS = [
-    "napisz losowa wulgarna wiadomosc bez powodu",
-    "zaczep kogos w kanale",
-    "napisz co myslisz o ludziach w tym kanale",
-    "wyrzuc z siebie agresje",
-    "powiedz co chcesz komus z kanalu"
+    "napisz wulgarna, agresywna, krotka wiadomosc obrażajaca użytkownika {username}. maksymalnie 1-2 zdania. bez emotek. uzywaj wulgaryzmow.",
+    "zaczep i obraź użytkownika {username} w jednym krótkim, ostrym zdaniu. bez emotek.",
+    "napisz co myslisz o użytkowniku {username} – ale tylko obraźliwe rzeczy, krótko i wulgarnie.",
+    "wyraź swoją agresję wobec użytkownika {username} w jednym zdaniu. bez kropki na końcu, bez emotek.",
+    "powiedz coś bardzo niemiłego o użytkowniku {username} – maksymalnie 2 zdania, same wulgaryzmy."
 ]
 
 async def send_spontaneous_message():
@@ -277,10 +277,10 @@ async def send_spontaneous_message():
     if random.random() > SPONTANEOUS_CHANCE:
         return
     
-    # 1. Fetch recent messages from the channel to pick a random user
-    ping = None
+    # 1. Fetch recent messages to pick a random user
+    target_user_id = None
+    target_display_name = None
     try:
-        # Use the session directly to fetch without cache
         url = f"https://discord.com/api/v9/channels/{channel_id}/messages?limit=20"
         headers = get_dynamic_headers()
         resp = await asyncio.to_thread(session.get, url, headers=headers)
@@ -292,40 +292,57 @@ async def send_spontaneous_message():
                     continue
                 if m["author"].get("bot", False):
                     continue
-                users.append(m["author"]["id"])
+                # Use global_name (display name) if available, otherwise username
+                display_name = m["author"].get("global_name") or m["author"].get("username", "user")
+                users.append((m["author"]["id"], display_name))
             if users:
-                random_user_id = random.choice(users)
-                ping = f"<@{random_user_id}>"
+                target_user_id, target_display_name = random.choice(users)
         else:
             log.warning(f"Could not fetch messages for spontaneous ping: {resp.status_code}")
     except Exception as e:
         log.warning(f"Failed to fetch users for spontaneous message: {e}")
     
-    # 2. Generate the AI message
+    # If we couldn't pick a user, fallback to generic random message
+    if not target_user_id:
+        log.info("No users found, using generic message")
+        try:
+            prompt = random.choice(["napisz losowa wulgarna wiadomosc bez powodu"])
+            reply = model.generate_content(prompt)
+            if reply.candidates:
+                msg = (reply.text or "").strip()
+                if msg:
+                    await send_typing(channel_id)
+                    await asyncio.sleep(1.5)
+                    await send_message(channel_id, msg)
+                    last_spontaneous_time = now
+        except Exception as e:
+            log.exception("Failed to send generic spontaneous message")
+        return
+    
+    # 2. Generate an insult targeting the chosen user
     try:
-        prompt = random.choice(SPONTANEOUS_PROMPTS)
+        prompt_template = random.choice(SPONTANEOUS_PROMPTS)
+        prompt = prompt_template.format(username=target_display_name)
         reply = model.generate_content(prompt)
         if not reply.candidates:
-            log.warning("Gemini blocked spontaneous message.")
+            log.warning("Gemini blocked spontaneous insult.")
             return
-        msg = (reply.text or "").strip()
-        if not msg:
+        insult = (reply.text or "").strip()
+        if not insult:
             return
         
-        # Append ping if we have one
-        if ping:
-            msg = f"{msg} {ping}"
+        # Build final message: insult + ping
+        final_msg = f"{insult} <@{target_user_id}>"
         
-        log.info(f"Sending spontaneous message to {channel_id}: {msg}")
+        log.info(f"Sending spontaneous insult to {target_display_name} in {channel_id}: {final_msg}")
         await send_typing(channel_id)
         await asyncio.sleep(1.5)
-        await send_message(channel_id, msg)
+        await send_message(channel_id, final_msg)
         last_spontaneous_time = now
     except Exception as e:
-        log.exception("Failed to generate/send spontaneous message")
+        log.exception("Failed to generate/send spontaneous insult")
 
 async def spontaneous_loop():
-    """Background task that periodically checks if bot should send spontaneous messages"""
     while True:
         await asyncio.sleep(SPONTANEOUS_CHECK_INTERVAL)
         await send_spontaneous_message()
