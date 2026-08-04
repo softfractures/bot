@@ -33,6 +33,11 @@ MAX_MESSAGES_PER_MINUTE = 5
 HISTORY_CACHE_TTL = 60
 MAX_HISTORY_PER_GUILD = 50
 
+# Spontaneous messages settings
+SPONTANEOUS_CHANCE = 0.03  # 3% chance per minute to send spontaneous message
+SPONTANEOUS_COOLDOWN = 180  # 3 minutes cooldown between spontaneous messages
+SPONTANEOUS_CHECK_INTERVAL = 60  # Check every minute
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("stealth-selfbot")
 
@@ -68,7 +73,8 @@ LATEST_BUILD, LATEST_VERSION = fetch_latest_build_info()
 # --------------------------------------------
 genai.configure(api_key=GEMINI_API_KEY)
 
-SYSTEM_PROMPT = (
+# Default system prompt
+DEFAULT_SYSTEM_PROMPT = (
 "jesteś wulgarnym agresywnym botem discord"
 "piszesz tylko małymi literami"
 "prawie bez interpunkcji"
@@ -83,7 +89,8 @@ SYSTEM_PROMPT = (
 "nie uzywasz polskich znakow (a zamiast a, e zamiast e, c zamiast c, l zamiast l, n zamiast n, o zamiast o, s zamiast s, z zamiast z, z zamiast z)"
 )
 
-model = genai.GenerativeModel(GEMINI_MODEL, system_instruction=SYSTEM_PROMPT)
+current_system_prompt = DEFAULT_SYSTEM_PROMPT
+model = genai.GenerativeModel(GEMINI_MODEL, system_instruction=current_system_prompt)
 
 # --------------------------------------------
 # DYNAMIC HEADER GENERATION
@@ -154,6 +161,12 @@ async def send_reply(channel_id, reply_to_id, content):
     resp = await api_request("POST", url, json=payload)
     return resp.status_code == 200
 
+async def send_message(channel_id, content):
+    url = f"https://discord.com/api/v9/channels/{channel_id}/messages"
+    payload = {"content": content}
+    resp = await api_request("POST", url, json=payload)
+    return resp.status_code == 200
+
 # --------------------------------------------
 # GLOBAL STATE
 # --------------------------------------------
@@ -166,6 +179,8 @@ last_message_time = 0
 current_ws = None
 voice_channels = {}
 persistent_voice_channels = {}
+last_spontaneous_time = 0
+active_channels = set()  # Track active channels for spontaneous messages
 
 guild_histories = {}
 channel_history_cache = {}
@@ -236,6 +251,64 @@ async def build_context(channel_id, current_msg, guild_id=None):
     return "\n".join(lines)
 
 # --------------------------------------------
+# SPONTANEOUS MESSAGES
+# --------------------------------------------
+SPONTANEOUS_PROMPTS = [
+    "napisz losowa wulgarna wiadomosc bez powodu",
+    "zaczep kogos w kanale",
+    "napisz co myslisz o ludziach w tym kanale",
+    "wyrzuc z siebie agresje",
+    "powiedz co chcesz komus z kanalu"
+]
+
+async def send_spontaneous_message():
+    global last_spontaneous_time
+    
+    if not active_channels:
+        return
+    
+    now = time.time()
+    if now - last_spontaneous_time < SPONTANEOUS_COOLDOWN:
+        return
+    
+    if random.random() > SPONTANEOUS_CHANCE:
+        return
+    
+    # Pick a random active channel
+    channel_id = random.choice(list(active_channels))
+    
+    # Generate spontaneous message using AI
+    try:
+        prompt = random.choice(SPONTANEOUS_PROMPTS)
+        reply = model.generate_content(prompt)
+        if reply.candidates:
+            msg = (reply.text or "").strip()
+            if msg:
+                log.info(f"Sending spontaneous message to channel {channel_id}: {msg}")
+                await send_typing(channel_id)
+                await asyncio.sleep(1.5)
+                await send_message(channel_id, msg)
+                last_spontaneous_time = now
+    except Exception as e:
+        log.exception("Failed to generate spontaneous message")
+
+async def spontaneous_loop():
+    """Background task that periodically checks if bot should send spontaneous messages"""
+    while True:
+        await asyncio.sleep(SPONTANEOUS_CHECK_INTERVAL)
+        await send_spontaneous_message()
+
+# --------------------------------------------
+# PROMPT MANAGEMENT
+# --------------------------------------------
+async def update_prompt(new_prompt):
+    global current_system_prompt, model
+    current_system_prompt = new_prompt
+    model = genai.GenerativeModel(GEMINI_MODEL, system_instruction=new_prompt)
+    log.info("System prompt updated")
+    return True
+
+# --------------------------------------------
 # MESSAGE QUEUE
 # --------------------------------------------
 message_queue = asyncio.Queue()
@@ -297,7 +370,8 @@ async def restore_voice_channels():
 # VOICE COMMANDS HANDLER
 # --------------------------------------------
 async def handle_command(msg):
-    global current_ws, voice_channels, persistent_voice_channels
+    global current_ws, voice_channels, persistent_voice_channels, current_system_prompt, model
+    
     content = msg.get("content", "")
     channel_id = msg["channel_id"]
     current_guild = msg.get("guild_id")
@@ -308,7 +382,7 @@ async def handle_command(msg):
         return
 
     cmd = parts[0].lower()
-    log.info(f"Command: {cmd} from guild {current_guild}, channel {channel_id}, ws alive: {current_ws is not None}")
+    log.info(f"Command: {cmd} from guild {current_guild}, channel {channel_id}")
 
     if cmd == ".test" or cmd == ".ping":
         status = "ws: ok" if current_ws else "ws: None"
@@ -321,6 +395,26 @@ async def handle_command(msg):
             await send_reply(channel_id, msg_id, "\n".join(lines))
         else:
             await send_reply(channel_id, msg_id, "nie jestem w żadnym kanale głosowym")
+        return
+
+    if cmd == ".prompt":
+        if len(parts) > 1:
+            # Update prompt
+            new_prompt = " ".join(parts[1:])
+            if await update_prompt(new_prompt):
+                await send_reply(channel_id, msg_id, f"zmieniono prompt na: {new_prompt[:100]}...")
+            else:
+                await send_reply(channel_id, msg_id, "nie udalo sie zmienic promptu")
+        else:
+            # Show current prompt
+            await send_reply(channel_id, msg_id, f"obecny prompt: {current_system_prompt[:200]}...")
+        return
+
+    if cmd == ".resetprompt":
+        if await update_prompt(DEFAULT_SYSTEM_PROMPT):
+            await send_reply(channel_id, msg_id, "przywrocono domyslny prompt")
+        else:
+            await send_reply(channel_id, msg_id, "nie udalo sie przywrocic promptu")
         return
 
     if current_ws is None:
@@ -417,7 +511,7 @@ async def handle_command(msg):
         return
 
 # --------------------------------------------
-# HANDLE MESSAGE (FIXED: owners get AI for mentions/replies)
+# HANDLE MESSAGE
 # --------------------------------------------
 async def handle_message(msg):
     global self_user_id
@@ -438,16 +532,24 @@ async def handle_message(msg):
             log.info(f"Ignoring command from {author_id} (not owner)")
         return
 
-    # Non‑command messages: if it's from a bot, ignore (already handled above)
-    # Now process AI for everyone (including owners) if it's a mention/reply or DM
-    # The filter already ensures only valid messages reach here, but we keep checks for safety.
-
-    # Actually we could just process AI for any message that got queued.
-    # Since filter already queues based on mention/reply, we can just proceed.
-
     channel_id = msg["channel_id"]
     msg_id = msg["id"]
     guild_id = msg.get("guild_id")
+
+    # Check if it's a mention or reply to self
+    mentioned = any(m["id"] == self_user_id for m in msg.get("mentions", []))
+    replied = False
+    if msg.get("referenced_message"):
+        ref = msg["referenced_message"]
+        if ref.get("author", {}).get("id") == self_user_id:
+            replied = True
+    
+    channel_type = msg.get("channel_type")
+    is_dm = channel_type in ("DM", "GROUP_DM")
+    
+    # Only respond if mentioned, replied to, or DM
+    if not (mentioned or replied or is_dm):
+        return
 
     # Faster typing & thinking
     await asyncio.sleep(random.uniform(0.5, 1.5))
@@ -488,13 +590,18 @@ async def handle_message(msg):
         await asyncio.sleep(CHUNK_DELAY + random.uniform(0, 0.3))
 
 # --------------------------------------------
-# FILTER (Fixed: owners get AI for mentions/replies too)
+# FILTER
 # --------------------------------------------
 async def filter_and_queue(msg):
     global self_user_id
     author_id = str(msg["author"]["id"])
     content = msg.get("content", "")
     is_bot = msg.get("author", {}).get("bot", False)
+    
+    # Track active channels
+    channel_id = msg.get("channel_id")
+    if channel_id and not is_bot:
+        active_channels.add(channel_id)
     
     # Ignore bots
     if is_bot:
@@ -505,7 +612,6 @@ async def filter_and_queue(msg):
         if author_id in OWNER_IDS or (self_user_id and author_id == self_user_id):
             log.info(f"Queueing command from owner: {content}")
             await message_queue.put(msg)
-        # else ignore – non-owners commands are ignored
         return
 
     # Non‑command messages: queue if it's a DM/group DM or mention/reply to self
@@ -572,14 +678,6 @@ async def voice_keepalive():
 # --------------------------------------------
 # WEBSOCKET LOGIC
 # --------------------------------------------
-async def heartbeat(ws, interval):
-    while True:
-        await asyncio.sleep(interval / 1000.0)
-        try:
-            await ws.send(json.dumps({"op": 1, "d": None}))
-        except:
-            break
-
 async def listen():
     global self_user_id, session_id, resume_gateway_url, last_seq, current_ws
     
@@ -625,6 +723,7 @@ async def listen():
             log.info("Identify sent (no intents)")
         
         keepalive_task = asyncio.create_task(voice_keepalive())
+        spontaneous_task = asyncio.create_task(spontaneous_loop())
         await restore_voice_channels()
         
         while True:
@@ -664,6 +763,18 @@ async def listen():
                 log.exception("Loop error")
         
         keepalive_task.cancel()
+        spontaneous_task.cancel()
+
+# --------------------------------------------
+# HEARTBEAT
+# --------------------------------------------
+async def heartbeat(ws, interval):
+    while True:
+        await asyncio.sleep(interval / 1000.0)
+        try:
+            await ws.send(json.dumps({"op": 1, "d": None}))
+        except:
+            break
 
 # --------------------------------------------
 # MAIN
