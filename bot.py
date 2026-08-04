@@ -32,11 +32,11 @@ SPONTANEOUS_COOLDOWN = 180
 SPONTANEOUS_CHECK_INTERVAL = 60
 SPONTANEOUS_CHANNEL_ID = "1458080496369139849"
 
-# Faster delays
-MIN_REPLY_DELAY = 2.0
-MAX_REPLY_DELAY = 4.0
-CHUNK_DELAY = 0.5
-MAX_MESSAGES_PER_MINUTE = 5
+# Faster delays – dostosowane do szybszego odpowiadania
+MIN_REPLY_DELAY = 0.5          # wcześniej 2.0
+MAX_REPLY_DELAY = 1.0          # wcześniej 4.0
+CHUNK_DELAY = 0.1              # wcześniej 0.5
+MAX_MESSAGES_PER_MINUTE = 10   # ustawione na 10 (prośba użytkownika)
 HISTORY_CACHE_TTL = 60
 MAX_HISTORY_PER_GUILD = 50
 
@@ -307,7 +307,7 @@ async def send_spontaneous_message():
                 msg = (reply.text or "").strip()
                 if msg:
                     await send_typing(channel_id)
-                    await asyncio.sleep(1.5)
+                    await asyncio.sleep(0.5)  # krótkie opóźnienie dla naturalności
                     await send_message(channel_id, msg)
                     last_spontaneous_time = now
         except Exception as e:
@@ -327,7 +327,7 @@ async def send_spontaneous_message():
         final_msg = f"{insult} <@{target_user_id}>"
         log.info(f"Sending spontaneous insult to {target_display_name} in {channel_id}: {final_msg}")
         await send_typing(channel_id)
-        await asyncio.sleep(1.5)
+        await asyncio.sleep(0.5)
         await send_message(channel_id, final_msg)
         last_spontaneous_time = now
     except Exception as e:
@@ -434,7 +434,8 @@ async def process_worker():
             log.exception("Worker error")
         finally:
             message_queue.task_done()
-            await asyncio.sleep(random.uniform(MIN_REPLY_DELAY, MAX_REPLY_DELAY))
+            # Usunięto sztuczne opóźnienie po wiadomości – teraz tylko rate_limiter kontroluje tempo
+            # await asyncio.sleep(random.uniform(MIN_REPLY_DELAY, MAX_REPLY_DELAY))  <-- usunięte
 
 # --------------------------------------------
 # RESTORE VOICE CHANNELS
@@ -705,9 +706,8 @@ async def handle_message(msg):
     if not (mentioned or replied or is_dm):
         return
 
-    await asyncio.sleep(random.uniform(0.5, 1.5))
+    # Wysyłamy sygnał pisania, ale bez zbędnych sleepów
     await send_typing(channel_id)
-    await asyncio.sleep(random.uniform(0.3, 0.6))
     
     context = await build_context(channel_id, msg, guild_id)
     
@@ -733,14 +733,13 @@ async def handle_message(msg):
         log.exception("AI failed - skipping reply.")
         return
 
-    await send_typing(channel_id)
-    log.info("Waiting 2 seconds (typing) before sending reply...")
-    await asyncio.sleep(2.0)
-
+    # Wysyłamy odpowiedź od razu – bez dodatkowego czekania
     for i in range(0, len(reply_text), 1900):
         chunk = reply_text[i:i+1900]
         await send_reply(channel_id, msg_id, chunk)
-        await asyncio.sleep(CHUNK_DELAY + random.uniform(0, 0.3))
+        # Krótkie opóźnienie między fragmentami, aby uniknąć floodu
+        if i + 1900 < len(reply_text):
+            await asyncio.sleep(CHUNK_DELAY)
 
 # --------------------------------------------
 # FILTER
@@ -939,6 +938,8 @@ async def main():
     
     asyncio.create_task(rate_limiter())
     asyncio.create_task(process_worker())
+    # Można dodać drugiego worker'a dla większej przepustowości (opcjonalnie)
+    # asyncio.create_task(process_worker())
     
     backoff = 2
     while True:
