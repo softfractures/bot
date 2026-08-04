@@ -5,7 +5,6 @@ import logging
 import random
 import time
 import base64
-import io
 import aiohttp
 import google.generativeai as genai
 from dotenv import load_dotenv
@@ -253,7 +252,7 @@ async def build_context(channel_id, current_msg, guild_id=None):
     return "\n".join(lines)
 
 # --------------------------------------------
-# SPONTANEOUS MESSAGES (unchanged)
+# SPONTANEOUS MESSAGES
 # --------------------------------------------
 SPONTANEOUS_PROMPTS = [
     "napisz wulgarna, agresywna, krotka wiadomosc obrażajaca użytkownika {username}. maksymalnie 1-2 zdania. bez emotek. uzywaj wulgaryzmow.",
@@ -350,11 +349,13 @@ async def update_prompt(new_prompt):
     return True
 
 # --------------------------------------------
-# PROFILE CHANGE FUNCTIONS (AVATAR + DISPLAY NAME)
+# PROFILE CHANGE FUNCTIONS (FIXED AVATAR)
 # --------------------------------------------
 async def change_avatar(image_data: bytes):
     if len(image_data) > 256 * 1024:
         return False, "Obraz jest za duży (max 256 KB)"
+    
+    # Detect MIME type
     if image_data.startswith(b'\xff\xd8'):
         mime = "image/jpeg"
     elif image_data.startswith(b'\x89PNG'):
@@ -362,10 +363,21 @@ async def change_avatar(image_data: bytes):
     elif image_data.startswith(b'GIF'):
         mime = "image/gif"
     else:
-        mime = "image/png"
+        mime = "image/png"  # fallback
+    
     b64 = base64.b64encode(image_data).decode()
-    payload = {"avatar": f"data:{mime};base64,{b64}"}
+    payload = {
+        "avatar": f"data:{mime};base64,{b64}"
+    }
+    
+    # Debug: log first 100 chars of data URI
+    log.debug(f"Avatar data URI preview: {payload['avatar'][:100]}...")
+    
     resp = await api_request("PATCH", "https://discord.com/api/v9/users/@me", json=payload)
+    
+    log.info(f"Avatar change response status: {resp.status_code}")
+    log.info(f"Avatar change response body: {resp.text[:500]}")
+    
     if resp.status_code == 200:
         return True, "Avatar zmieniony"
     else:
@@ -373,7 +385,7 @@ async def change_avatar(image_data: bytes):
             error_data = resp.json()
             error_msg = error_data.get('message', 'Brak szczegółów')
         except:
-            error_msg = resp.text[:100]
+            error_msg = resp.text[:200]
         return False, f"Nie udało się zmienić (status {resp.status_code}): {error_msg}"
 
 async def change_display_name(new_display: str):
@@ -450,7 +462,7 @@ async def restore_voice_channels():
             log.warning(f"Failed to restore voice for guild {guild_id}: {e}")
 
 # --------------------------------------------
-# VOICE COMMANDS HANDLER (UPDATED – .name removed)
+# VOICE COMMANDS HANDLER
 # --------------------------------------------
 async def handle_command(msg):
     global current_ws, voice_channels, persistent_voice_channels, current_system_prompt, model
@@ -513,6 +525,9 @@ async def handle_command(msg):
                     async with sess.get(url) as resp:
                         if resp.status == 200:
                             image_data = await resp.read()
+                        else:
+                            await send_reply(channel_id, msg_id, f"nie udało się pobrać załącznika (status {resp.status})")
+                            return
             except Exception as e:
                 log.exception("Failed to download attachment")
                 await send_reply(channel_id, msg_id, "nie mogę pobrać załącznika")
@@ -524,6 +539,9 @@ async def handle_command(msg):
                     async with sess.get(img_url) as resp:
                         if resp.status == 200:
                             image_data = await resp.read()
+                        else:
+                            await send_reply(channel_id, msg_id, f"nie udało się pobrać obrazu (status {resp.status})")
+                            return
             except Exception as e:
                 log.exception("Failed to download image from URL")
                 await send_reply(channel_id, msg_id, "nie mogę pobrać obrazu z podanego URL")
@@ -543,7 +561,7 @@ async def handle_command(msg):
             await send_reply(channel_id, msg_id, f"nie udało się zmienić avatara: {message}")
         return
 
-    # -------------------- DISPLAY NAME CHANGE (global_name) --------------------
+    # -------------------- DISPLAY NAME CHANGE --------------------
     if cmd == ".display":
         if len(parts) < 2:
             await send_reply(channel_id, msg_id, "użycie: .display <nowy_display_name>")
