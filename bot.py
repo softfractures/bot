@@ -187,6 +187,50 @@ guild_histories = {}
 channel_history_cache = {}
 
 # --------------------------------------------
+# IGNORE / SPAM DETECTION (NEW)
+# --------------------------------------------
+ignored_users = {}               # user_id -> expiry_timestamp (0 = permanent)
+mention_timestamps = {}          # user_id -> list of timestamps (for spam detection)
+SPAM_WINDOW = 5                  # seconds
+SPAM_THRESHOLD = 5               # mentions/replies in window
+AUTO_IGNORE_DURATION = 3600      # 1 hour
+
+def is_ignored(user_id):
+    """Check if user is currently ignored (including expiry)."""
+    if user_id not in ignored_users:
+        return False
+    expiry = ignored_users[user_id]
+    if expiry == 0:  # permanent
+        return True
+    if time.time() < expiry:
+        return True
+    # expired
+    del ignored_users[user_id]
+    return False
+
+def check_mention_spam(user_id):
+    """
+    Update mention timestamps and return True if spam threshold is exceeded.
+    If exceeded, automatically ignore the user for AUTO_IGNORE_DURATION.
+    """
+    now = time.time()
+    if user_id not in mention_timestamps:
+        mention_timestamps[user_id] = []
+    timestamps = mention_timestamps[user_id]
+    # Remove old entries
+    timestamps = [t for t in timestamps if now - t <= SPAM_WINDOW]
+    timestamps.append(now)
+    mention_timestamps[user_id] = timestamps
+    if len(timestamps) >= SPAM_THRESHOLD:
+        # Auto-ignore
+        ignored_users[user_id] = now + AUTO_IGNORE_DURATION
+        log.info(f"Auto-ignored user {user_id} for {AUTO_IGNORE_DURATION}s due to spam")
+        # Optionally clean up mention timestamps to avoid repeated triggers
+        mention_timestamps[user_id] = []
+        return True
+    return False
+
+# --------------------------------------------
 # PER‑SERVER HISTORY HELPERS
 # --------------------------------------------
 def add_to_guild_history(key, author_name, content, msg_id, timestamp):
@@ -434,8 +478,6 @@ async def process_worker():
             log.exception("Worker error")
         finally:
             message_queue.task_done()
-            # Usunięto sztuczne opóźnienie po wiadomości – teraz tylko rate_limiter kontroluje tempo
-            # await asyncio.sleep(random.uniform(MIN_REPLY_DELAY, MAX_REPLY_DELAY))  <-- usunięte
 
 # --------------------------------------------
 # RESTORE VOICE CHANNELS
@@ -575,6 +617,66 @@ async def handle_command(msg):
             await send_reply(channel_id, msg_id, f"nie udało się zmienić display name: {message}")
         return
 
+    # -------------------- IGNORE / UNIGNORE (NEW) --------------------
+    if cmd == ".ignore":
+        # Only owners can use this command
+        author_id = str(msg["author"]["id"])
+        if author_id not in OWNER_IDS:
+            await send_reply(channel_id, msg_id, "nie masz uprawnień do tej komendy")
+            return
+        if len(parts) < 2:
+            await send_reply(channel_id, msg_id, "użycie: .ignore <user_id>")
+            return
+        target = parts[1]
+        if not target.isdigit():
+            await send_reply(channel_id, msg_id, "id musi być liczbą")
+            return
+        # Add permanent ignore (expiry = 0)
+        ignored_users[target] = 0
+        # Also clear any mention timestamps
+        mention_timestamps.pop(target, None)
+        log.info(f"Manually ignored user {target}")
+        await send_reply(channel_id, msg_id, f"użytkownik {target} został zignorowany na stałe")
+        return
+
+    if cmd == ".unignore":
+        author_id = str(msg["author"]["id"])
+        if author_id not in OWNER_IDS:
+            await send_reply(channel_id, msg_id, "nie masz uprawnień do tej komendy")
+            return
+        if len(parts) < 2:
+            await send_reply(channel_id, msg_id, "użycie: .unignore <user_id>")
+            return
+        target = parts[1]
+        if not target.isdigit():
+            await send_reply(channel_id, msg_id, "id musi być liczbą")
+            return
+        if target in ignored_users:
+            del ignored_users[target]
+            log.info(f"Manually unignored user {target}")
+            await send_reply(channel_id, msg_id, f"użytkownik {target} został usunięty z ignorowanych")
+        else:
+            await send_reply(channel_id, msg_id, f"użytkownik {target} nie jest ignorowany")
+        return
+
+    if cmd == ".ignorelist":
+        author_id = str(msg["author"]["id"])
+        if author_id not in OWNER_IDS:
+            await send_reply(channel_id, msg_id, "nie masz uprawnień do tej komendy")
+            return
+        if not ignored_users:
+            await send_reply(channel_id, msg_id, "brak ignorowanych użytkowników")
+            return
+        lines = ["ignorowani:"]
+        for uid, exp in ignored_users.items():
+            if exp == 0:
+                lines.append(f"{uid} (na stałe)")
+            else:
+                remaining = int(exp - time.time())
+                lines.append(f"{uid} (jeszcze {remaining}s)")
+        await send_reply(channel_id, msg_id, "\n".join(lines))
+        return
+
     # --- VOICE COMMANDS ---
     if current_ws is None:
         await send_reply(channel_id, msg_id, "websocket nieaktywny, spróbuj ponownie za chwilę")
@@ -681,6 +783,11 @@ async def handle_message(msg):
     if is_bot:
         return
 
+    # --- Check if user is ignored ---
+    if is_ignored(author_id):
+        log.debug(f"Ignoring message from ignored user {author_id}")
+        return
+
     if content.startswith("."):
         if author_id in OWNER_IDS or (self_user_id and author_id == self_user_id):
             log.info(f"Processing command from owner: {content}")
@@ -704,6 +811,12 @@ async def handle_message(msg):
     is_dm = channel_type in ("DM", "GROUP_DM")
     
     if not (mentioned or replied or is_dm):
+        return
+
+    # --- Spam detection (auto-ignore) ---
+    if check_mention_spam(author_id):
+        # User is now ignored; we drop this message and any future ones
+        log.info(f"User {author_id} auto-ignored due to spam, dropping this message")
         return
 
     # Wysyłamy sygnał pisania, ale bez zbędnych sleepów
@@ -755,6 +868,11 @@ async def filter_and_queue(msg):
         active_channels.add(channel_id)
     
     if is_bot:
+        return
+
+    # --- If ignored, drop immediately ---
+    if is_ignored(author_id):
+        log.debug(f"Dropping message from ignored user {author_id}")
         return
 
     if content.startswith("."):
