@@ -13,6 +13,7 @@ from curl_cffi import requests
 from PIL import Image
 import io
 
+
 load_dotenv()
 
 # --------------------------------------------
