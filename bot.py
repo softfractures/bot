@@ -6,12 +6,15 @@ import random
 import time
 import base64
 import aiohttp
-import google.generativeai as genai
 from dotenv import load_dotenv
 import websockets
 from curl_cffi import requests
 from PIL import Image
 import io
+
+# Import the new Google GenAI package
+from google import genai
+from google.genai import types
 
 load_dotenv()
 
@@ -20,7 +23,7 @@ load_dotenv()
 # --------------------------------------------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")  # Changed to 2.0
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
 # Multiple owners
 OWNER_IDS = [
@@ -38,7 +41,7 @@ SPONTANEOUS_CHANNEL_ID = "1458080496369139849"
 MIN_REPLY_DELAY = 0.8
 MAX_REPLY_DELAY = 2.5
 CHUNK_DELAY = 0.3
-MAX_MESSAGES_PER_MINUTE = 8  # zmniejszone dla bezpieczeństwa
+MAX_MESSAGES_PER_MINUTE = 8
 HISTORY_CACHE_TTL = 60
 MAX_HISTORY_PER_GUILD = 50
 
@@ -54,6 +57,7 @@ if not DISCORD_TOKEN or not GEMINI_API_KEY:
 def fetch_latest_build_info():
     try:
         url = "https://raw.githubusercontent.com/qoft/discord-api/main/fetch"
+        # Use a supported impersonation
         response = requests.get(url, timeout=10, impersonate="chrome120")
         response.raise_for_status()
         data = response.json()
@@ -73,9 +77,10 @@ def fetch_latest_build_info():
 LATEST_BUILD, LATEST_VERSION = fetch_latest_build_info()
 
 # --------------------------------------------
-# GEMINI SETUP
+# GEMINI SETUP - Using new google.genai
 # --------------------------------------------
-genai.configure(api_key=GEMINI_API_KEY)
+# Initialize the client
+client = genai.Client(api_key=GEMINI_API_KEY)
 
 # Nowy prompt - wulgarny agresywny
 DEFAULT_SYSTEM_PROMPT = (
@@ -95,31 +100,89 @@ DEFAULT_SYSTEM_PROMPT = (
 )
 
 current_system_prompt = DEFAULT_SYSTEM_PROMPT
-model = genai.GenerativeModel(GEMINI_MODEL, system_instruction=current_system_prompt)
+
+# For the new API, we'll pass system instruction with each request
+def get_gemini_response(prompt, image=None):
+    """Get response from Gemini using the new API"""
+    try:
+        # Prepare content parts
+        contents = []
+        
+        # Add system instruction as a user message with system context
+        system_message = f"System: {current_system_prompt}\n\nUser: {prompt}"
+        
+        if image:
+            # For images, use the generate_content with image
+            # Convert PIL Image to bytes if needed
+            if hasattr(image, 'read'):
+                # It's a file-like object
+                image_bytes = image.read()
+            elif isinstance(image, Image.Image):
+                # It's a PIL Image
+                img_byte_arr = io.BytesIO()
+                image.save(img_byte_arr, format='PNG')
+                image_bytes = img_byte_arr.getvalue()
+            else:
+                image_bytes = image
+            
+            # Upload the image to Gemini
+            uploaded_file = client.files.upload(
+                file=io.BytesIO(image_bytes),
+                config=types.UploadFileConfig(
+                    mime_type="image/png"
+                )
+            )
+            
+            # Generate response with image
+            response = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=[
+                    types.Content(
+                        role="user",
+                        parts=[
+                            types.Part(text=system_message),
+                            types.Part(file_data=types.FileData(file_uri=uploaded_file.uri))
+                        ]
+                    )
+                ]
+            )
+        else:
+            # Text only
+            response = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=system_message
+            )
+        
+        return response.text if response.text else None
+    except Exception as e:
+        log.exception(f"Gemini API error: {e}")
+        return None
 
 # --------------------------------------------
-# DYNAMIC HEADER GENERATION - ULEPSZONE
+# DYNAMIC HEADER GENERATION - Only supported impersonations
 # --------------------------------------------
 def get_random_user_agent():
     """Zwraca losowy user-agent, aby wyglądać jak różne przeglądarki"""
     user_agents = [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36 Edg/119.0.0.0",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
     ]
     return random.choice(user_agents)
 
+def get_supported_impersonate():
+    """Return only supported impersonation strings"""
+    return random.choice(["chrome120", "chrome121", "chrome119", "chrome118"])
+
 def get_dynamic_headers():
     user_agent = get_random_user_agent()
-    # Losowy build number w okolicach aktualnego
     build_variation = random.randint(-50, 50)
     current_build = LATEST_BUILD + build_variation
     
     properties = {
         "os": "Windows",
-        "browser": "Chrome" if "Chrome" in user_agent else "Firefox" if "Firefox" in user_agent else "Edge",
+        "browser": "Chrome",
         "device": "",
         "system_locale": random.choice(["en-US", "pl-PL", "en-GB"]),
         "browser_user_agent": user_agent,
@@ -135,7 +198,6 @@ def get_dynamic_headers():
     }
     super_properties = base64.b64encode(json.dumps(properties, separators=(',', ':')).encode()).decode()
     
-    # Losowe opóźnienie dla bardziej naturalnego zachowania
     time.sleep(random.uniform(0.01, 0.05))
     
     return {
@@ -157,7 +219,8 @@ def get_dynamic_headers():
 # ASYNC API REQUEST
 # --------------------------------------------
 session = requests.Session()
-session.impersonate = random.choice(["chrome120", "chrome121", "firefox121", "edge119"])
+# Use only supported impersonations
+session.impersonate = get_supported_impersonate()
 
 async def api_request(method, url, **kwargs):
     while True:
@@ -165,8 +228,10 @@ async def api_request(method, url, **kwargs):
         if 'headers' in kwargs:
             headers.update(kwargs.pop('headers'))
         
-        # Losowe opóźnienie przed requestem
         await asyncio.sleep(random.uniform(0.1, 0.5))
+        
+        # Update session impersonation randomly
+        session.impersonate = get_supported_impersonate()
         
         resp = await asyncio.to_thread(session.request, method, url, headers=headers, **kwargs)
         if resp.status_code == 429:
@@ -181,7 +246,6 @@ async def api_request(method, url, **kwargs):
 # ASYNC HELPERS
 # --------------------------------------------
 async def send_typing(channel_id):
-    # Losowe opóźnienie przed wysłaniem sygnału pisania
     await asyncio.sleep(random.uniform(0.2, 0.8))
     await api_request("POST", f"https://discord.com/api/v9/channels/{channel_id}/typing")
 
@@ -207,20 +271,17 @@ async def send_message(channel_id, content):
 def is_static_image(image_data):
     """Check if image is static (not animated)"""
     try:
-        # Check for GIF animation
         if image_data.startswith(b'GIF'):
             try:
-                from PIL import Image
                 with Image.open(io.BytesIO(image_data)) as img:
                     if getattr(img, 'is_animated', False):
-                        return False  # Animated GIF
-                    return True  # Static GIF
+                        return False
+                    return True
             except:
                 return False
-        # For other formats (JPEG, PNG, etc.)
         try:
             with Image.open(io.BytesIO(image_data)) as img:
-                return True  # Static image
+                return True
         except:
             return False
     except Exception as e:
@@ -241,7 +302,6 @@ async def download_image(url):
 def prepare_image_for_gemini(image_data):
     """Prepare image for Gemini API"""
     try:
-        # Determine image type
         if image_data.startswith(b'\xff\xd8'):
             mime_type = "image/jpeg"
         elif image_data.startswith(b'\x89PNG'):
@@ -251,14 +311,10 @@ def prepare_image_for_gemini(image_data):
         else:
             mime_type = "image/jpeg"
         
-        # For GIF, ensure it's static
         if image_data.startswith(b'GIF'):
-            # Try to extract first frame as PNG
             try:
-                from PIL import Image
                 with Image.open(io.BytesIO(image_data)) as img:
                     if getattr(img, 'is_animated', False):
-                        # Extract first frame
                         img.seek(0)
                         output = io.BytesIO()
                         img.convert('RGB').save(output, format='PNG')
@@ -369,14 +425,11 @@ async def build_context(channel_id, current_msg, guild_id=None):
     lines = []
     channel_msgs = await get_cached_channel_history(channel_id, current_msg["id"])
     
-    # Check if current message has attachment (image)
     has_image = False
     image_data = None
     if current_msg.get("attachments"):
         for att in current_msg["attachments"]:
-            # Check if it's an image
             if att.get("content_type", "").startswith("image/"):
-                # Download the image
                 image_data = await download_image(att["url"])
                 if image_data and is_static_image(image_data):
                     has_image = True
@@ -388,7 +441,6 @@ async def build_context(channel_id, current_msg, guild_id=None):
     for m in reversed(channel_msgs):
         author = m["author"].get("global_name") or m["author"]["username"]
         msg_content = m["content"]
-        # Check if this message had an image
         if m.get("attachments"):
             for att in m["attachments"]:
                 if att.get("content_type", "").startswith("image/"):
@@ -417,7 +469,6 @@ async def build_context(channel_id, current_msg, guild_id=None):
     author = current_msg["author"].get("global_name") or current_msg["author"]["username"]
     lines.append(f"{author}: {current_msg['content']}")
     
-    # Add image info if present
     if has_image and image_data:
         return "\n".join(lines), image_data
     
@@ -476,9 +527,9 @@ async def send_spontaneous_message():
         log.info("No users found, using generic message")
         try:
             prompt = "napisz agresywna wulgarna wiadomosc do nikogo. krotko ostro."
-            reply = model.generate_content(prompt)
-            if reply.candidates:
-                msg = (reply.text or "").strip()
+            reply = get_gemini_response(prompt)
+            if reply:
+                msg = reply.strip()
                 if msg:
                     await send_typing(channel_id)
                     await asyncio.sleep(random.uniform(0.5, 1.5))
@@ -489,24 +540,23 @@ async def send_spontaneous_message():
         return
     
     try:
-        # Najpierw ping
         ping_msg = f"@{target_display_name}"
         await send_typing(channel_id)
         await asyncio.sleep(random.uniform(0.3, 1.0))
         await send_message(channel_id, ping_msg)
         log.info(f"Sent ping to {target_display_name} in {channel_id}")
         
-        # Potem wiadomość
         prompt_template = random.choice(SPONTANEOUS_PROMPTS)
         if target_content:
             prompt = f"wiadomosc uzytkownika: {target_content}\n{prompt_template.format(username=target_display_name)}"
         else:
             prompt = prompt_template.format(username=target_display_name)
-        reply = model.generate_content(prompt)
-        if not reply.candidates:
+        
+        reply = get_gemini_response(prompt)
+        if not reply:
             log.warning("Gemini blocked spontaneous message.")
             return
-        msg_text = (reply.text or "").strip()
+        msg_text = reply.strip()
         if not msg_text:
             return
         
@@ -529,9 +579,8 @@ async def spontaneous_loop():
 # PROMPT MANAGEMENT
 # --------------------------------------------
 async def update_prompt(new_prompt):
-    global current_system_prompt, model
+    global current_system_prompt
     current_system_prompt = new_prompt
-    model = genai.GenerativeModel(GEMINI_MODEL, system_instruction=new_prompt)
     log.info("System prompt updated")
     return True
 
@@ -644,7 +693,7 @@ async def restore_voice_channels():
 # VOICE COMMANDS HANDLER
 # --------------------------------------------
 async def handle_command(msg):
-    global current_ws, voice_channels, persistent_voice_channels, current_system_prompt, model
+    global current_ws, voice_channels, persistent_voice_channels, current_system_prompt
     
     content = msg.get("content", "")
     channel_id = msg["channel_id"]
@@ -671,7 +720,6 @@ async def handle_command(msg):
             await send_reply(channel_id, msg_id, "nie jestem w zadnym kanale glosowym")
         return
 
-    # NOWA KOMENDA DO ZMIANY PROMPTU
     if cmd == ".prompt":
         if len(parts) > 1:
             new_prompt = " ".join(parts[1:])
@@ -680,11 +728,9 @@ async def handle_command(msg):
             else:
                 await send_reply(channel_id, msg_id, "nie udalo sie zmienic promptu")
         else:
-            # Pokaż aktualny prompt
             await send_reply(channel_id, msg_id, f"obecny prompt: {current_system_prompt[:200]}...")
         return
 
-    # RESET PROMPTU
     if cmd == ".resetprompt":
         if await update_prompt(DEFAULT_SYSTEM_PROMPT):
             await send_reply(channel_id, msg_id, "przywrocono domyslny prompt")
@@ -692,7 +738,6 @@ async def handle_command(msg):
             await send_reply(channel_id, msg_id, "nie udalo sie przywrocic promptu")
         return
 
-    # ZMIANA AVATARA
     if cmd == ".avatar":
         image_data = None
         if msg.get("attachments"):
@@ -945,12 +990,10 @@ async def handle_message(msg):
         log.info(f"User {author_id} auto-ignored due to spam, dropping this message")
         return
 
-    # Losowe opóźnienie przed odpowiedzią - wygląda bardziej naturalnie
     await asyncio.sleep(random.uniform(MIN_REPLY_DELAY, MAX_REPLY_DELAY))
     
     await send_typing(channel_id)
     
-    # Build context with image if present
     context, image_data = await build_context(channel_id, msg, guild_id)
     
     author_name = msg["author"].get("global_name") or msg["author"]["username"]
@@ -961,51 +1004,26 @@ async def handle_message(msg):
         add_to_guild_history(f"dm_{channel_id}", author_name, msg["content"], msg_id, timestamp)
 
     try:
-        # Prepare message for Gemini
         if image_data:
-            # Process image with Gemini
             try:
-                # Prepare image for Gemini
                 image_bytes, mime_type = prepare_image_for_gemini(image_data)
-                
-                # Create image part for Gemini
-                from PIL import Image
-                import io
                 img = Image.open(io.BytesIO(image_bytes))
                 
-                # Generate response with image
-                response = model.generate_content([
-                    f"Kontekst:\n{context}\n\nOdpowiedz na ostatnia wiadomosc. Mow wulgarnie i agresywnie, ale odnos sie do tresci obrazka jesli jest istotny.",
-                    img
-                ])
+                prompt = f"Kontekst:\n{context}\n\nOdpowiedz na ostatnia wiadomosc. Mow wulgarnie i agresywnie, ale odnos sie do tresci obrazka jesli jest istotny."
+                reply_text = get_gemini_response(prompt, img)
                 
-                if not response.candidates:
-                    feedback = response.prompt_feedback
-                    block_reason = feedback.block_reason if feedback else "unknown"
-                    log.warning(f"Gemini blocked content. Reason: {block_reason} - skipping reply.")
-                    return
-                reply_text = (response.text or "").strip()
                 if not reply_text:
                     log.info("Gemini returned empty response - skipping reply.")
                     return
             except Exception as e:
                 log.exception(f"Error processing image with Gemini: {e}")
-                # Fallback to text only
-                response = model.generate_content(f"Kontekst:\n{context}\n\nOdpowiedz na ostatnia wiadomosc. W obrazku jest cos, ale nie moge go odczytac. Odpowiedz wulgarnie i agresywnie.")
-                if not response.candidates:
-                    return
-                reply_text = (response.text or "").strip()
+                prompt = f"Kontekst:\n{context}\n\nOdpowiedz na ostatnia wiadomosc. W obrazku jest cos, ale nie moge go odczytac. Odpowiedz wulgarnie i agresywnie."
+                reply_text = get_gemini_response(prompt)
                 if not reply_text:
                     return
         else:
-            # Text only
-            response = model.generate_content(f"Kontekst:\n{context}\n\nOdpowiedz na ostatnia wiadomosc.")
-            if not response.candidates:
-                feedback = response.prompt_feedback
-                block_reason = feedback.block_reason if feedback else "unknown"
-                log.warning(f"Gemini blocked content. Reason: {block_reason} - skipping reply.")
-                return
-            reply_text = (response.text or "").strip()
+            prompt = f"Kontekst:\n{context}\n\nOdpowiedz na ostatnia wiadomosc."
+            reply_text = get_gemini_response(prompt)
             if not reply_text:
                 log.info("Gemini returned empty response - skipping reply.")
                 return
@@ -1013,7 +1031,6 @@ async def handle_message(msg):
         log.exception("AI failed - skipping reply.")
         return
 
-    # Wysyłanie wiadomości z losowymi opóźnieniami między fragmentami
     for i in range(0, len(reply_text), 1900):
         chunk = reply_text[i:i+1900]
         await send_reply(channel_id, msg_id, chunk)
@@ -1200,7 +1217,6 @@ async def listen():
 # HEARTBEAT
 # --------------------------------------------
 async def heartbeat(ws, interval):
-    # Dodajemy małe losowe opóźnienie do heartbeat
     jitter = random.uniform(-0.5, 0.5)
     while True:
         await asyncio.sleep((interval / 1000.0) + jitter)
