@@ -5,12 +5,9 @@ import logging
 import random
 import time
 import base64
-import aiohttp
 from dotenv import load_dotenv
 import websockets
 from curl_cffi import requests
-from PIL import Image
-import io
 
 # Import the new Google GenAI package
 from google import genai
@@ -23,7 +20,7 @@ load_dotenv()
 # --------------------------------------------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")  # Changed to 3.6 flash
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 
 # Multiple owners
 OWNER_IDS = [
@@ -44,11 +41,6 @@ CHUNK_DELAY = 0.1
 MAX_MESSAGES_PER_MINUTE = 10
 HISTORY_CACHE_TTL = 60
 MAX_HISTORY_PER_GUILD = 50
-
-# Aggressive image compression for speed
-MAX_IMAGE_SIZE = 300 * 1024  # 300KB max - smaller for speed
-IMAGE_QUALITY = 60  # Lower quality = faster processing
-MAX_IMAGE_DIMENSION = 768  # Smaller dimension = faster
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("stealth-selfbot")
@@ -81,7 +73,7 @@ def fetch_latest_build_info():
 LATEST_BUILD, LATEST_VERSION = fetch_latest_build_info()
 
 # --------------------------------------------
-# GEMINI SETUP - Using new google.genai
+# GEMINI SETUP
 # --------------------------------------------
 client = genai.Client(api_key=GEMINI_API_KEY)
 
@@ -103,101 +95,21 @@ DEFAULT_SYSTEM_PROMPT = (
 
 current_system_prompt = DEFAULT_SYSTEM_PROMPT
 
-def fast_compress_image(image_bytes, max_size=MAX_IMAGE_SIZE, max_dimension=MAX_IMAGE_DIMENSION, quality=IMAGE_QUALITY):
-    """Fast image compression for Gemini - aggressive but fast"""
-    try:
-        # Open image
-        img = Image.open(io.BytesIO(image_bytes))
-        
-        # Convert to RGB if needed
-        if img.mode in ('RGBA', 'LA', 'P'):
-            img = img.convert('RGB')
-        
-        # Quick resize if too large
-        width, height = img.size
-        if width > max_dimension or height > max_dimension:
-            ratio = min(max_dimension / width, max_dimension / height)
-            new_width = int(width * ratio)
-            new_height = int(height * ratio)
-            img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-        
-        # Compress to JPEG with low quality for speed
-        output = io.BytesIO()
-        img.save(output, format='JPEG', quality=quality, optimize=True)
-        compressed = output.getvalue()
-        
-        # If still too large, aggressively reduce
-        if len(compressed) > max_size:
-            for q in range(quality - 10, 20, -5):
-                output = io.BytesIO()
-                img.save(output, format='JPEG', quality=q, optimize=True)
-                compressed = output.getvalue()
-                if len(compressed) <= max_size:
-                    break
-        
-        log.info(f"Fast compressed: {len(image_bytes)} → {len(compressed)} bytes")
-        return compressed
-        
-    except Exception as e:
-        log.warning(f"Fast compression failed: {e}, using original")
-        return image_bytes
-
-def get_gemini_response(prompt, image=None):
-    """Get response from Gemini - fast with compressed images"""
+def get_gemini_response(prompt):
+    """Get response from Gemini"""
     try:
         system_message = f"{current_system_prompt}\n\n{prompt}"
         
-        if image:
-            # Fast compress the image
-            if isinstance(image, Image.Image):
-                img_byte_arr = io.BytesIO()
-                image.save(img_byte_arr, format='PNG')
-                image_bytes = img_byte_arr.getvalue()
-            else:
-                image_bytes = image
-            
-            # Compress aggressively
-            image_bytes = fast_compress_image(image_bytes)
-            
-            # Upload the compressed image
-            uploaded_file = client.files.upload(
-                file=io.BytesIO(image_bytes),
-                config=types.UploadFileConfig(
-                    mime_type="image/jpeg"
-                )
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=system_message,
+            config=types.GenerateContentConfig(
+                temperature=0.9,
+                max_output_tokens=150,
+                top_p=0.95,
+                top_k=40,
             )
-            
-            # Generate response with image - short timeout
-            response = client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=[
-                    types.Content(
-                        role="user",
-                        parts=[
-                            types.Part(text=system_message),
-                            types.Part(file_data=types.FileData(file_uri=uploaded_file.uri))
-                        ]
-                    )
-                ],
-                config=types.GenerateContentConfig(
-                    temperature=0.9,
-                    max_output_tokens=150,  # Short responses
-                    top_p=0.95,
-                    top_k=40,
-                )
-            )
-        else:
-            # Text only - fast
-            response = client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=system_message,
-                config=types.GenerateContentConfig(
-                    temperature=0.9,
-                    max_output_tokens=150,
-                    top_p=0.95,
-                    top_k=40,
-                )
-            )
+        )
         
         return response.text if response.text else None
     except Exception as e:
@@ -315,69 +227,6 @@ async def send_message(channel_id, content):
     return resp.status_code == 200
 
 # --------------------------------------------
-# IMAGE ANALYSIS HELPERS - No GIF support
-# --------------------------------------------
-def is_supported_image_format(image_data):
-    """Check if image is a supported format (PNG, JPG, JPEG, WEBP)"""
-    try:
-        with Image.open(io.BytesIO(image_data)) as img:
-            fmt = img.format.upper() if img.format else ""
-            supported = fmt in ['PNG', 'JPEG', 'WEBP']
-            if not supported:
-                log.info(f"Unsupported image format: {fmt} (skipping)")
-            return supported
-    except Exception as e:
-        log.warning(f"Error checking image format: {e}")
-        return False
-
-async def download_image(url):
-    try:
-        async with aiohttp.ClientSession() as sess:
-            async with sess.get(url) as resp:
-                if resp.status == 200:
-                    return await resp.read()
-    except Exception as e:
-        log.warning(f"Failed to download image: {e}")
-    return None
-
-def fast_prepare_image(image_data):
-    """Fast prepare image - aggressive compression"""
-    try:
-        with Image.open(io.BytesIO(image_data)) as img:
-            # Convert to RGB if needed
-            if img.mode in ('RGBA', 'LA', 'P'):
-                img = img.convert('RGB')
-            
-            # Aggressively resize
-            width, height = img.size
-            max_dim = MAX_IMAGE_DIMENSION
-            if width > max_dim or height > max_dim:
-                ratio = min(max_dim / width, max_dim / height)
-                new_width = int(width * ratio)
-                new_height = int(height * ratio)
-                img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-            
-            # Compress to JPEG with low quality
-            output = io.BytesIO()
-            img.save(output, format='JPEG', quality=IMAGE_QUALITY, optimize=True)
-            compressed = output.getvalue()
-            
-            # If still too large, reduce quality
-            if len(compressed) > MAX_IMAGE_SIZE:
-                for q in range(IMAGE_QUALITY - 10, 20, -5):
-                    output = io.BytesIO()
-                    img.save(output, format='JPEG', quality=q, optimize=True)
-                    compressed = output.getvalue()
-                    if len(compressed) <= MAX_IMAGE_SIZE:
-                        break
-            
-            log.info(f"Fast prepared: {len(image_data)} → {len(compressed)} bytes")
-            return compressed, "image/jpeg"
-    except Exception as e:
-        log.warning(f"Error preparing image: {e}")
-        return None, None
-
-# --------------------------------------------
 # GLOBAL STATE
 # --------------------------------------------
 self_user_id = None
@@ -469,55 +318,22 @@ async def get_cached_channel_history(channel_id, before_id):
     return []
 
 # --------------------------------------------
-# CONTEXT BUILDER (async) - No GIF support
+# CONTEXT BUILDER
 # --------------------------------------------
 async def build_context(channel_id, current_msg, guild_id=None):
     lines = []
     channel_msgs = await get_cached_channel_history(channel_id, current_msg["id"])
     
-    has_image = False
-    image_data = None
-    
-    # Check attachments - only PNG, JPG, JPEG, WEBP
-    if current_msg.get("attachments"):
-        for att in current_msg["attachments"]:
-            content_type = att.get("content_type", "")
-            filename = att.get("filename", "")
-            
-            # Skip GIFs
-            if content_type == "image/gif" or filename.lower().endswith('.gif'):
-                log.info(f"Skipping GIF: {filename}")
-                continue
-            
-            if content_type.startswith("image/"):
-                log.info(f"Found image: {filename} ({content_type})")
-                image_data = await download_image(att["url"])
-                if image_data:
-                    if is_supported_image_format(image_data):
-                        has_image = True
-                        log.info(f"✓ Supported: {filename} ({len(image_data)} bytes)")
-                        break
-                    else:
-                        image_data = None
-                else:
-                    log.warning(f"Failed to download: {filename}")
-    
     for m in reversed(channel_msgs):
         author = m["author"].get("global_name") or m["author"]["username"]
-        msg_content = m["content"]
-        if m.get("attachments"):
-            for att in m["attachments"]:
-                if att.get("content_type", "").startswith("image/"):
-                    msg_content += " [image]"
-                    break
-        lines.append(f"{author}: {msg_content}")
+        lines.append(f"{author}: {m['content']}")
     
     if guild_id:
         guild_key = f"guild_{guild_id}"
         guild_history = get_guild_history(guild_key, limit=10)
         for entry in guild_history:
             if entry["id"] != current_msg["id"]:
-                lines.append(f"[Memory] {entry['author']}: {entry['content']}")
+                lines.append(f"[Guild memory] {entry['author']}: {entry['content']}")
     
     if current_msg.get("referenced_message"):
         ref = current_msg["referenced_message"]
@@ -527,11 +343,7 @@ async def build_context(channel_id, current_msg, guild_id=None):
     
     author = current_msg["author"].get("global_name") or current_msg["author"]["username"]
     lines.append(f"{author}: {current_msg['content']}")
-    
-    if has_image and image_data:
-        return "\n".join(lines), image_data
-    
-    return "\n".join(lines), None
+    return "\n".join(lines)
 
 # --------------------------------------------
 # SPONTANEOUS MESSAGES
@@ -1038,7 +850,7 @@ async def handle_message(msg):
 
     await send_typing(channel_id)
     
-    context, image_data = await build_context(channel_id, msg, guild_id)
+    context = await build_context(channel_id, msg, guild_id)
     
     author_name = msg["author"].get("global_name") or msg["author"]["username"]
     timestamp = time.time()
@@ -1048,36 +860,13 @@ async def handle_message(msg):
         add_to_guild_history(f"dm_{channel_id}", author_name, msg["content"], msg_id, timestamp)
 
     try:
-        if image_data:
-            log.info("Processing image")
-            try:
-                image_bytes, mime_type = fast_prepare_image(image_data)
-                
-                if image_bytes is None:
-                    prompt = f"Kontekst:\n{context}\n\nOdpowiedz na ostatnia wiadomosc. Uzytkownik wyslal obrazek ale nie moge go przeczytac."
-                    reply_text = get_gemini_response(prompt)
-                    if not reply_text:
-                        return
-                else:
-                    img = Image.open(io.BytesIO(image_bytes))
-                    prompt = f"Kontekst:\n{context}\n\nOdpowiedz na ostatnia wiadomosc. Mow wulgarnie i agresywnie, ale odnos sie do tresci obrazka."
-                    reply_text = get_gemini_response(prompt, img)
-                    
-                    if not reply_text:
-                        return
-            except Exception as e:
-                log.exception(f"Image error: {e}")
-                prompt = f"Kontekst:\n{context}\n\nOdpowiedz na ostatnia wiadomosc."
-                reply_text = get_gemini_response(prompt)
-                if not reply_text:
-                    return
-        else:
-            prompt = f"Kontekst:\n{context}\n\nOdpowiedz na ostatnia wiadomosc."
-            reply_text = get_gemini_response(prompt)
-            if not reply_text:
-                return
+        prompt = f"Kontekst:\n{context}\n\nOdpowiedz na ostatnia wiadomosc."
+        reply_text = get_gemini_response(prompt)
+        if not reply_text:
+            log.info("Gemini returned empty response - skipping reply.")
+            return
     except Exception as e:
-        log.exception("AI failed")
+        log.exception("AI failed - skipping reply.")
         return
 
     for i in range(0, len(reply_text), 1900):
@@ -1120,8 +909,7 @@ async def filter_and_queue(msg):
     if msg.get("referenced_message"):
         ref = msg["referenced_message"]
         if ref.get("author", {}).get("id") == self_user_id:
-            replied = True
-    
+            replied = True    
     if mentioned or replied:
         await message_queue.put(msg)
 
