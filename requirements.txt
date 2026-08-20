@@ -3,3 +3,4 @@ websockets
 curl-cffi
 python-dotenv
 aiohttp>=3.8.0
+Pillow
