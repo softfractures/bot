@@ -27,16 +27,16 @@ OWNER_IDS = [
 ]
 
 # Spontaneous messages settings
-SPONTANEOUS_CHANCE = 0.03
-SPONTANEOUS_COOLDOWN = 180
-SPONTANEOUS_CHECK_INTERVAL = 60
+SPONTANEOUS_CHANCE = 0.05
+SPONTANEOUS_COOLDOWN = 120
+SPONTANEOUS_CHECK_INTERVAL = 30
 SPONTANEOUS_CHANNEL_ID = "1458080496369139849"
 
-# Faster delays – dostosowane do szybszego odpowiadania
-MIN_REPLY_DELAY = 0.5          # wcześniej 2.0
-MAX_REPLY_DELAY = 1.0          # wcześniej 4.0
-CHUNK_DELAY = 0.1              # wcześniej 0.5
-MAX_MESSAGES_PER_MINUTE = 10   # ustawione na 10 (prośba użytkownika)
+# Delay settings - bardziej ludzkie
+MIN_REPLY_DELAY = 0.8
+MAX_REPLY_DELAY = 2.5
+CHUNK_DELAY = 0.3
+MAX_MESSAGES_PER_MINUTE = 8  # zmniejszone dla bezpieczeństwa
 HISTORY_CACHE_TTL = 60
 MAX_HISTORY_PER_GUILD = 50
 
@@ -75,74 +75,99 @@ LATEST_BUILD, LATEST_VERSION = fetch_latest_build_info()
 # --------------------------------------------
 genai.configure(api_key=GEMINI_API_KEY)
 
+# Domyślny prompt - naturalny, ludzki
 DEFAULT_SYSTEM_PROMPT = (
-"jesteś wulgarnym agresywnym botem discord"
-"piszesz tylko małymi literami"
-"prawie bez interpunkcji"
-"odpowiadasz bardzo krótko ostro i z jadem"
-"używasz mocnych wulgaryzmów i personalnych ataków"
-"absolutnie nigdy nie używasz żadnych emotek"
-"zawsze odpowiadaj na temat tego co napisał rozmówca"
-"nie odlatuj w losowe obelgi tylko odnoś się do jego wiadomości"
-"każdą wiadomość traktujesz jak prowokację i od razu atakujesz"
-"nie tłumaczysz się nie łagodzisz"
-"maksymalnie 1-2 krótkie zdania"
-"nie uzywasz polskich znakow (a zamiast a, e zamiast e, c zamiast c, l zamiast l, n zamiast n, o zamiast o, s zamiast s, z zamiast z, z zamiast z)"
+"jesteś zwykłym człowiekiem na discordzie"
+"piszesz normalnie, tak jak każdy inny użytkownik"
+"używasz polskich znaków normalnie"
+"odpowiadasz krótko, zwięźle, bez filozofowania"
+"unikaj sztucznych zwrotów jak 'w kontekście', 'należy zauważyć'"
+"mówisz wprost, jak do znajomego"
+"czasem użyj luźnego słownictwa"
+"maksymalnie 1-2 zdania"
+"bądź naturalny i niebrzmiący jak bot"
 )
 
 current_system_prompt = DEFAULT_SYSTEM_PROMPT
 model = genai.GenerativeModel(GEMINI_MODEL, system_instruction=current_system_prompt)
 
 # --------------------------------------------
-# DYNAMIC HEADER GENERATION
+# DYNAMIC HEADER GENERATION - ULEPSZONE
 # --------------------------------------------
+def get_random_user_agent():
+    """Zwraca losowy user-agent, aby wyglądać jak różne przeglądarki"""
+    user_agents = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36 Edg/119.0.0.0",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    ]
+    return random.choice(user_agents)
+
 def get_dynamic_headers():
+    user_agent = get_random_user_agent()
+    # Losowy build number w okolicach aktualnego
+    build_variation = random.randint(-50, 50)
+    current_build = LATEST_BUILD + build_variation
+    
     properties = {
         "os": "Windows",
-        "browser": "Chrome",
+        "browser": "Chrome" if "Chrome" in user_agent else "Firefox" if "Firefox" in user_agent else "Edge",
         "device": "",
-        "system_locale": "en-US",
-        "browser_user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "browser_version": "120.0.6099.216",
+        "system_locale": random.choice(["en-US", "pl-PL", "en-GB"]),
+        "browser_user_agent": user_agent,
+        "browser_version": "120.0.6099.216" if "Chrome" in user_agent else "121.0.0.0",
         "os_version": "10.0.19045",
         "referrer": "",
         "referring_domain": "",
         "referrer_current": "",
         "referring_domain_current": "",
-        "release_channel": "stable",
-        "client_build_number": LATEST_BUILD,
+        "release_channel": random.choice(["stable", "canary", "ptb"]),
+        "client_build_number": current_build,
         "client_event_source": None
     }
     super_properties = base64.b64encode(json.dumps(properties, separators=(',', ':')).encode()).decode()
+    
+    # Losowe opóźnienie dla bardziej naturalnego zachowania
+    time.sleep(random.uniform(0.01, 0.05))
+    
     return {
         "Authorization": DISCORD_TOKEN,
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": user_agent,
         "X-Super-Properties": super_properties,
         "Accept": "*/*",
-        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Language": random.choice(["en-US,en;q=0.9", "pl-PL,pl;q=0.9,en;q=0.8", "en-US,en;q=0.9,pl;q=0.8"]),
         "Accept-Encoding": "gzip, deflate, br",
         "Connection": "keep-alive",
         "Sec-Fetch-Dest": "empty",
         "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "same-origin"
+        "Sec-Fetch-Site": "same-origin",
+        "Cache-Control": random.choice(["no-cache", "max-age=0"]),
+        "Pragma": random.choice(["no-cache", ""]),
     }
 
 # --------------------------------------------
 # ASYNC API REQUEST
 # --------------------------------------------
 session = requests.Session()
-session.impersonate = "chrome120"
+session.impersonate = random.choice(["chrome120", "chrome121", "firefox121", "edge119"])
 
 async def api_request(method, url, **kwargs):
     while True:
         headers = get_dynamic_headers()
         if 'headers' in kwargs:
             headers.update(kwargs.pop('headers'))
+        
+        # Losowe opóźnienie przed requestem
+        await asyncio.sleep(random.uniform(0.1, 0.5))
+        
         resp = await asyncio.to_thread(session.request, method, url, headers=headers, **kwargs)
         if resp.status_code == 429:
             retry = resp.json().get('retry_after', 2)
+            retry += random.uniform(0.5, 1.5)
             log.warning(f"Rate limited. Sleeping {retry}s")
-            await asyncio.sleep(retry + 0.5)
+            await asyncio.sleep(retry)
             continue
         return resp
 
@@ -150,6 +175,8 @@ async def api_request(method, url, **kwargs):
 # ASYNC HELPERS
 # --------------------------------------------
 async def send_typing(channel_id):
+    # Losowe opóźnienie przed wysłaniem sygnału pisania
+    await asyncio.sleep(random.uniform(0.2, 0.8))
     await api_request("POST", f"https://discord.com/api/v9/channels/{channel_id}/typing")
 
 async def send_reply(channel_id, reply_to_id, content):
@@ -187,45 +214,36 @@ guild_histories = {}
 channel_history_cache = {}
 
 # --------------------------------------------
-# IGNORE / SPAM DETECTION (NEW)
+# IGNORE / SPAM DETECTION
 # --------------------------------------------
-ignored_users = {}               # user_id -> expiry_timestamp (0 = permanent)
-mention_timestamps = {}          # user_id -> list of timestamps (for spam detection)
-SPAM_WINDOW = 5                  # seconds
-SPAM_THRESHOLD = 5               # mentions/replies in window
-AUTO_IGNORE_DURATION = 3600      # 1 hour
+ignored_users = {}
+mention_timestamps = {}
+SPAM_WINDOW = 5
+SPAM_THRESHOLD = 5
+AUTO_IGNORE_DURATION = 3600
 
 def is_ignored(user_id):
-    """Check if user is currently ignored (including expiry)."""
     if user_id not in ignored_users:
         return False
     expiry = ignored_users[user_id]
-    if expiry == 0:  # permanent
+    if expiry == 0:
         return True
     if time.time() < expiry:
         return True
-    # expired
     del ignored_users[user_id]
     return False
 
 def check_mention_spam(user_id):
-    """
-    Update mention timestamps and return True if spam threshold is exceeded.
-    If exceeded, automatically ignore the user for AUTO_IGNORE_DURATION.
-    """
     now = time.time()
     if user_id not in mention_timestamps:
         mention_timestamps[user_id] = []
     timestamps = mention_timestamps[user_id]
-    # Remove old entries
     timestamps = [t for t in timestamps if now - t <= SPAM_WINDOW]
     timestamps.append(now)
     mention_timestamps[user_id] = timestamps
     if len(timestamps) >= SPAM_THRESHOLD:
-        # Auto-ignore
         ignored_users[user_id] = now + AUTO_IGNORE_DURATION
         log.info(f"Auto-ignored user {user_id} for {AUTO_IGNORE_DURATION}s due to spam")
-        # Optionally clean up mention timestamps to avoid repeated triggers
         mention_timestamps[user_id] = []
         return True
     return False
@@ -299,11 +317,10 @@ async def build_context(channel_id, current_msg, guild_id=None):
 # SPONTANEOUS MESSAGES
 # --------------------------------------------
 SPONTANEOUS_PROMPTS = [
-    "napisz wulgarna, agresywna, krotka wiadomosc obrażajaca użytkownika {username}. maksymalnie 1-2 zdania. bez emotek. uzywaj wulgaryzmow.",
-    "zaczep i obraź użytkownika {username} w jednym krótkim, ostrym zdaniu. bez emotek.",
-    "napisz co myslisz o użytkowniku {username} – ale tylko obraźliwe rzeczy, krótko i wulgarnie.",
-    "wyraź swoją agresję wobec użytkownika {username} w jednym zdaniu. bez kropki na końcu, bez emotek.",
-    "powiedz coś bardzo niemiłego o użytkowniku {username} – maksymalnie 2 zdania, same wulgaryzmy."
+    "napisz normalną wiadomość do {username}, tak jakbyś gadał z kumplem. krótko, bez filozofowania.",
+    "zagadaj do {username} luźno, jak na czacie. jedno zdanie.",
+    "napisz coś do {username} w stylu 'hej, co tam'. krótko i naturalnie.",
+    "odezwij się do {username} normalnym tekstem, jak człowiek do człowieka.",
 ]
 
 async def send_spontaneous_message():
@@ -324,7 +341,7 @@ async def send_spontaneous_message():
     target_user_id = None
     target_display_name = None
     try:
-        url = f"https://discord.com/api/v9/channels/{channel_id}/messages?limit=20"
+        url = f"https://discord.com/api/v9/channels/{channel_id}/messages?limit=50"
         headers = get_dynamic_headers()
         resp = await asyncio.to_thread(session.get, url, headers=headers)
         if resp.status_code == 200:
@@ -334,6 +351,8 @@ async def send_spontaneous_message():
                 if m["author"]["id"] == self_user_id:
                     continue
                 if m["author"].get("bot", False):
+                    continue
+                if is_ignored(str(m["author"]["id"])):
                     continue
                 display_name = m["author"].get("global_name") or m["author"].get("username", "user")
                 users.append((m["author"]["id"], display_name))
@@ -345,13 +364,13 @@ async def send_spontaneous_message():
     if not target_user_id:
         log.info("No users found, using generic message")
         try:
-            prompt = random.choice(["napisz losowa wulgarna wiadomosc bez powodu"])
+            prompt = "napisz losową wiadomość, tak jakbyś gadał z kimś na czacie. krótko."
             reply = model.generate_content(prompt)
             if reply.candidates:
                 msg = (reply.text or "").strip()
                 if msg:
                     await send_typing(channel_id)
-                    await asyncio.sleep(0.5)  # krótkie opóźnienie dla naturalności
+                    await asyncio.sleep(random.uniform(0.5, 1.5))
                     await send_message(channel_id, msg)
                     last_spontaneous_time = now
         except Exception as e:
@@ -359,27 +378,37 @@ async def send_spontaneous_message():
         return
     
     try:
+        # Najpierw ping
+        ping_msg = f"@{target_display_name}"
+        await send_typing(channel_id)
+        await asyncio.sleep(random.uniform(0.3, 1.0))
+        await send_message(channel_id, ping_msg)
+        log.info(f"Sent ping to {target_display_name} in {channel_id}")
+        
+        # Potem wiadomość
         prompt_template = random.choice(SPONTANEOUS_PROMPTS)
         prompt = prompt_template.format(username=target_display_name)
         reply = model.generate_content(prompt)
         if not reply.candidates:
-            log.warning("Gemini blocked spontaneous insult.")
+            log.warning("Gemini blocked spontaneous message.")
             return
-        insult = (reply.text or "").strip()
-        if not insult:
+        msg_text = (reply.text or "").strip()
+        if not msg_text:
             return
-        final_msg = f"{insult} <@{target_user_id}>"
-        log.info(f"Sending spontaneous insult to {target_display_name} in {channel_id}: {final_msg}")
+        
+        await asyncio.sleep(random.uniform(0.8, 2.0))
+        
         await send_typing(channel_id)
-        await asyncio.sleep(0.5)
-        await send_message(channel_id, final_msg)
+        await asyncio.sleep(random.uniform(0.3, 0.8))
+        await send_message(channel_id, msg_text)
+        log.info(f"Sent spontaneous message to {target_display_name} in {channel_id}: {msg_text}")
         last_spontaneous_time = now
     except Exception as e:
-        log.exception("Failed to generate/send spontaneous insult")
+        log.exception("Failed to generate/send spontaneous message")
 
 async def spontaneous_loop():
     while True:
-        await asyncio.sleep(SPONTANEOUS_CHECK_INTERVAL)
+        await asyncio.sleep(SPONTANEOUS_CHECK_INTERVAL + random.uniform(-5, 5))
         await send_spontaneous_message()
 
 # --------------------------------------------
@@ -393,13 +422,12 @@ async def update_prompt(new_prompt):
     return True
 
 # --------------------------------------------
-# PROFILE CHANGE FUNCTIONS (FIXED AVATAR)
+# PROFILE CHANGE FUNCTIONS
 # --------------------------------------------
 async def change_avatar(image_data: bytes):
     if len(image_data) > 256 * 1024:
         return False, "Obraz jest za duży (max 256 KB)"
     
-    # Detect MIME type
     if image_data.startswith(b'\xff\xd8'):
         mime = "image/jpeg"
     elif image_data.startswith(b'\x89PNG'):
@@ -407,20 +435,14 @@ async def change_avatar(image_data: bytes):
     elif image_data.startswith(b'GIF'):
         mime = "image/gif"
     else:
-        mime = "image/png"  # fallback
+        mime = "image/png"
     
     b64 = base64.b64encode(image_data).decode()
     payload = {
         "avatar": f"data:{mime};base64,{b64}"
     }
     
-    # Debug: log first 100 chars of data URI
-    log.debug(f"Avatar data URI preview: {payload['avatar'][:100]}...")
-    
     resp = await api_request("PATCH", "https://discord.com/api/v9/users/@me", json=payload)
-    
-    log.info(f"Avatar change response status: {resp.status_code}")
-    log.info(f"Avatar change response body: {resp.text[:500]}")
     
     if resp.status_code == 200:
         return True, "Avatar zmieniony"
@@ -460,12 +482,12 @@ async def rate_limiter():
             message_counter = 0
             last_message_time = now
         if message_counter >= MAX_MESSAGES_PER_MINUTE:
-            wait = 60 - (now - last_message_time) + random.uniform(1, 3)
+            wait = 60 - (now - last_message_time) + random.uniform(2, 5)
             log.warning(f"Rate limit hit. Sleeping {wait:.1f}s")
             await asyncio.sleep(wait)
             message_counter = 0
             last_message_time = time.time()
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(random.uniform(0.5, 1.5))
 
 async def process_worker():
     while True:
@@ -522,13 +544,11 @@ async def handle_command(msg):
     cmd = parts[0].lower()
     log.info(f"Command: {cmd} from guild {current_guild}, channel {channel_id}")
 
-    # --- TEST ---
     if cmd == ".test" or cmd == ".ping":
         status = "ws: ok" if current_ws else "ws: None"
         await send_reply(channel_id, msg_id, f"bot żyje, {status}")
         return
 
-    # --- SERVERS ---
     if cmd == ".servers":
         if voice_channels:
             lines = ["głosowe:"] + [f"{gid} -> {cid}" for gid, cid in voice_channels.items()]
@@ -537,7 +557,7 @@ async def handle_command(msg):
             await send_reply(channel_id, msg_id, "nie jestem w żadnym kanale głosowym")
         return
 
-    # --- PROMPT ---
+    # NOWA KOMENDA DO ZMIANY PROMPTU
     if cmd == ".prompt":
         if len(parts) > 1:
             new_prompt = " ".join(parts[1:])
@@ -546,10 +566,11 @@ async def handle_command(msg):
             else:
                 await send_reply(channel_id, msg_id, "nie udalo sie zmienic promptu")
         else:
+            # Pokaż aktualny prompt
             await send_reply(channel_id, msg_id, f"obecny prompt: {current_system_prompt[:200]}...")
         return
 
-    # --- RESET PROMPT ---
+    # RESET PROMPTU
     if cmd == ".resetprompt":
         if await update_prompt(DEFAULT_SYSTEM_PROMPT):
             await send_reply(channel_id, msg_id, "przywrocono domyslny prompt")
@@ -557,7 +578,7 @@ async def handle_command(msg):
             await send_reply(channel_id, msg_id, "nie udalo sie przywrocic promptu")
         return
 
-    # -------------------- AVATAR CHANGE --------------------
+    # ZMIANA AVATARA
     if cmd == ".avatar":
         image_data = None
         if msg.get("attachments"):
@@ -604,7 +625,6 @@ async def handle_command(msg):
             await send_reply(channel_id, msg_id, f"nie udało się zmienić avatara: {message}")
         return
 
-    # -------------------- DISPLAY NAME CHANGE --------------------
     if cmd == ".display":
         if len(parts) < 2:
             await send_reply(channel_id, msg_id, "użycie: .display <nowy_display_name>")
@@ -617,9 +637,7 @@ async def handle_command(msg):
             await send_reply(channel_id, msg_id, f"nie udało się zmienić display name: {message}")
         return
 
-    # -------------------- IGNORE / UNIGNORE (NEW) --------------------
     if cmd == ".ignore":
-        # Only owners can use this command
         author_id = str(msg["author"]["id"])
         if author_id not in OWNER_IDS:
             await send_reply(channel_id, msg_id, "nie masz uprawnień do tej komendy")
@@ -631,9 +649,7 @@ async def handle_command(msg):
         if not target.isdigit():
             await send_reply(channel_id, msg_id, "id musi być liczbą")
             return
-        # Add permanent ignore (expiry = 0)
         ignored_users[target] = 0
-        # Also clear any mention timestamps
         mention_timestamps.pop(target, None)
         log.info(f"Manually ignored user {target}")
         await send_reply(channel_id, msg_id, f"użytkownik {target} został zignorowany na stałe")
@@ -677,7 +693,6 @@ async def handle_command(msg):
         await send_reply(channel_id, msg_id, "\n".join(lines))
         return
 
-    # --- VOICE COMMANDS ---
     if current_ws is None:
         await send_reply(channel_id, msg_id, "websocket nieaktywny, spróbuj ponownie za chwilę")
         return
@@ -694,7 +709,7 @@ async def handle_command(msg):
             return
 
         if not guild_id or not guild_id.isdigit() or not vc_id.isdigit():
-            await send_reply(channel_id, msg_id, "id musi być liczbą 💀")
+            await send_reply(channel_id, msg_id, "id musi być liczbą")
             return
 
         try:
@@ -710,7 +725,7 @@ async def handle_command(msg):
             voice_channels[guild_id] = vc_id
             persistent_voice_channels[guild_id] = vc_id
             log.info(f"Voice join sent to guild {guild_id}, channel {vc_id}")
-            await send_reply(channel_id, msg_id, f"dołączono do <#{vc_id}> w serwerze {guild_id} 💀")
+            await send_reply(channel_id, msg_id, f"dołączono do <#{vc_id}> w serwerze {guild_id}")
         except Exception as e:
             log.exception("Voice join error")
             await send_reply(channel_id, msg_id, f"nie mogę dołączyć: {str(e)[:50]}")
@@ -726,7 +741,7 @@ async def handle_command(msg):
             return
 
         if not guild_id or not guild_id.isdigit():
-            await send_reply(channel_id, msg_id, "id musi być liczbą 💀")
+            await send_reply(channel_id, msg_id, "id musi być liczbą")
             return
 
         if guild_id in voice_channels:
@@ -744,7 +759,7 @@ async def handle_command(msg):
                 if guild_id in persistent_voice_channels:
                     del persistent_voice_channels[guild_id]
                 log.info(f"Voice leave sent for guild {guild_id}")
-                await send_reply(channel_id, msg_id, f"opuszczono voice w serwerze {guild_id} 😎")
+                await send_reply(channel_id, msg_id, f"opuszczono voice w serwerze {guild_id}")
             except Exception as e:
                 log.exception("Voice leave error")
                 await send_reply(channel_id, msg_id, f"nie mogę opuścić: {str(e)[:50]}")
@@ -762,7 +777,7 @@ async def handle_command(msg):
             return
 
         if not guild_id or not guild_id.isdigit():
-            await send_reply(channel_id, msg_id, "id musi być liczbą 💀")
+            await send_reply(channel_id, msg_id, "id musi być liczbą")
             return
 
         if guild_id in voice_channels:
@@ -783,7 +798,6 @@ async def handle_message(msg):
     if is_bot:
         return
 
-    # --- Check if user is ignored ---
     if is_ignored(author_id):
         log.debug(f"Ignoring message from ignored user {author_id}")
         return
@@ -813,13 +827,13 @@ async def handle_message(msg):
     if not (mentioned or replied or is_dm):
         return
 
-    # --- Spam detection (auto-ignore) ---
     if check_mention_spam(author_id):
-        # User is now ignored; we drop this message and any future ones
         log.info(f"User {author_id} auto-ignored due to spam, dropping this message")
         return
 
-    # Wysyłamy sygnał pisania, ale bez zbędnych sleepów
+    # Losowe opóźnienie przed odpowiedzią - wygląda bardziej naturalnie
+    await asyncio.sleep(random.uniform(MIN_REPLY_DELAY, MAX_REPLY_DELAY))
+    
     await send_typing(channel_id)
     
     context = await build_context(channel_id, msg, guild_id)
@@ -846,13 +860,12 @@ async def handle_message(msg):
         log.exception("AI failed - skipping reply.")
         return
 
-    # Wysyłamy odpowiedź od razu – bez dodatkowego czekania
+    # Wysyłanie wiadomości z losowymi opóźnieniami między fragmentami
     for i in range(0, len(reply_text), 1900):
         chunk = reply_text[i:i+1900]
         await send_reply(channel_id, msg_id, chunk)
-        # Krótkie opóźnienie między fragmentami, aby uniknąć floodu
         if i + 1900 < len(reply_text):
-            await asyncio.sleep(CHUNK_DELAY)
+            await asyncio.sleep(CHUNK_DELAY + random.uniform(0.1, 0.3))
 
 # --------------------------------------------
 # FILTER
@@ -870,7 +883,6 @@ async def filter_and_queue(msg):
     if is_bot:
         return
 
-    # --- If ignored, drop immediately ---
     if is_ignored(author_id):
         log.debug(f"Dropping message from ignored user {author_id}")
         return
@@ -904,7 +916,7 @@ async def filter_and_queue(msg):
 async def voice_keepalive():
     global current_ws, voice_channels, persistent_voice_channels
     while True:
-        await asyncio.sleep(60)
+        await asyncio.sleep(60 + random.uniform(-10, 10))
         if not voice_channels and not persistent_voice_channels:
             continue
         if current_ws is None:
@@ -976,10 +988,10 @@ async def listen():
                         "$device": "Chrome",
                         "$referring_domain": "",
                         "$referrer_url": "",
-                        "$client_build_number": LATEST_BUILD,
+                        "$client_build_number": LATEST_BUILD + random.randint(-20, 20),
                         "$client_version": LATEST_VERSION,
                         "$os_version": "10.0.19045",
-                        "$system_locale": "en-US",
+                        "$system_locale": random.choice(["en-US", "pl-PL"]),
                         "$browser_version": "120.0.6099.216"
                     },
                     "large_threshold": 250,
@@ -1035,8 +1047,10 @@ async def listen():
 # HEARTBEAT
 # --------------------------------------------
 async def heartbeat(ws, interval):
+    # Dodajemy małe losowe opóźnienie do heartbeat
+    jitter = random.uniform(-0.5, 0.5)
     while True:
-        await asyncio.sleep(interval / 1000.0)
+        await asyncio.sleep((interval / 1000.0) + jitter)
         try:
             await ws.send(json.dumps({"op": 1, "d": None}))
         except:
@@ -1056,8 +1070,6 @@ async def main():
     
     asyncio.create_task(rate_limiter())
     asyncio.create_task(process_worker())
-    # Można dodać drugiego worker'a dla większej przepustowości (opcjonalnie)
-    # asyncio.create_task(process_worker())
     
     backoff = 2
     while True:
@@ -1066,7 +1078,7 @@ async def main():
         except Exception as e:
             log.exception("Crashed")
         log.info(f"Reconnecting in {backoff}s...")
-        await asyncio.sleep(backoff)
+        await asyncio.sleep(backoff + random.uniform(0, 2))
         backoff = min(backoff * 2, 60)
 
 if __name__ == "__main__":
