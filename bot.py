@@ -144,9 +144,10 @@ def get_gemini_response(prompt, image=None):
         return None
 
 # --------------------------------------------
-# SUPPORTED IMPERSONATIONS
+# SUPPORTED IMPERSONATIONS - ONLY THESE ARE CONFIRMED TO WORK
 # --------------------------------------------
-SUPPORTED_IMPERSONATIONS = ["chrome120", "chrome123", "chrome124", "chrome126"]
+# Based on curl_cffi documentation and common errors
+SUPPORTED_IMPERSONATIONS = ["chrome120", "chrome123", "chrome124"]
 
 def get_supported_impersonate():
     return random.choice(SUPPORTED_IMPERSONATIONS)
@@ -156,7 +157,6 @@ def get_random_user_agent():
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
     ]
     return random.choice(user_agents)
 
@@ -199,27 +199,42 @@ def get_dynamic_headers():
     }
 
 # --------------------------------------------
-# ASYNC API REQUEST
+# ASYNC API REQUEST - WITH RETRY ON IMPERSONATION ERROR
 # --------------------------------------------
 session = requests.Session()
 session.impersonate = "chrome120"
 
 async def api_request(method, url, **kwargs):
     while True:
-        headers = get_dynamic_headers()
-        if 'headers' in kwargs:
-            headers.update(kwargs.pop('headers'))
-        
-        if random.random() < 0.3:
-            session.impersonate = get_supported_impersonate()
-        
-        resp = await asyncio.to_thread(session.request, method, url, headers=headers, **kwargs)
-        if resp.status_code == 429:
-            retry = resp.json().get('retry_after', 2)
-            log.warning(f"Rate limited. Sleeping {retry}s")
-            await asyncio.sleep(retry + 0.5)
+        try:
+            headers = get_dynamic_headers()
+            if 'headers' in kwargs:
+                headers.update(kwargs.pop('headers'))
+            
+            # Use a stable impersonation - don't change it randomly
+            # to avoid unsupported impersonation errors
+            session.impersonate = "chrome120"
+            
+            resp = await asyncio.to_thread(session.request, method, url, headers=headers, **kwargs)
+            
+            if resp.status_code == 429:
+                retry = resp.json().get('retry_after', 2)
+                log.warning(f"Rate limited. Sleeping {retry}s")
+                await asyncio.sleep(retry + 0.5)
+                continue
+            return resp
+            
+        except requests.exceptions.RequestException as e:
+            if "ImpersonateError" in str(e) or "impersonate" in str(e).lower():
+                log.warning(f"Impersonation error: {e}, retrying with chrome120")
+                session.impersonate = "chrome120"
+                await asyncio.sleep(1)
+                continue
+            raise e
+        except Exception as e:
+            log.exception(f"API request error: {e}")
+            await asyncio.sleep(2)
             continue
-        return resp
 
 # --------------------------------------------
 # ASYNC HELPERS
@@ -256,7 +271,6 @@ def is_static_image(image_data):
             
             # For animated GIFs, check if all frames are identical
             try:
-                # Get first frame
                 img.seek(0)
                 first_frame = img.convert('RGB')
                 first_frame_data = first_frame.tobytes()
@@ -265,7 +279,6 @@ def is_static_image(image_data):
                 if n_frames <= 1:
                     return True
                 
-                # Check if all frames are the same
                 is_static = True
                 for i in range(1, n_frames):
                     img.seek(i)
@@ -281,7 +294,6 @@ def is_static_image(image_data):
                 return is_static
                     
             except Exception as e:
-                # If we can't check frames, treat as static
                 log.warning(f"Could not check GIF frames, treating as static: {e}")
                 return True
                 
@@ -303,12 +315,10 @@ def prepare_image_for_gemini(image_data):
     """Prepare image for Gemini API - returns None for animated GIFs"""
     try:
         with Image.open(io.BytesIO(image_data)) as img:
-            # If it's a GIF
             if getattr(img, 'format', '').upper() == 'GIF':
                 is_animated = getattr(img, 'is_animated', False)
                 
                 if is_animated:
-                    # Check if all frames are identical (static GIF)
                     try:
                         img.seek(0)
                         first_frame = img.convert('RGB')
@@ -324,29 +334,24 @@ def prepare_image_for_gemini(image_data):
                                 break
                         
                         if is_static:
-                            # Convert static GIF to PNG
                             output = io.BytesIO()
                             first_frame.save(output, format='PNG')
                             log.info("Converted static GIF to PNG for Gemini")
                             return output.getvalue(), "image/png"
                         else:
-                            # Animated GIF - skip
                             log.info("Skipping animated GIF")
                             return None, None
                     except Exception as e:
                         log.warning(f"Error checking GIF frames: {e}")
-                        # Try first frame as fallback
                         output = io.BytesIO()
                         img.seek(0)
                         img.convert('RGB').save(output, format='PNG')
                         return output.getvalue(), "image/png"
                 else:
-                    # Static GIF (not animated)
                     output = io.BytesIO()
                     img.convert('RGB').save(output, format='PNG')
                     return output.getvalue(), "image/png"
             
-            # For other formats, return as-is
             if image_data.startswith(b'\xff\xd8'):
                 return image_data, "image/jpeg"
             elif image_data.startswith(b'\x89PNG'):
@@ -1038,18 +1043,15 @@ async def handle_message(msg):
     try:
         if image_data:
             try:
-                # Prepare image - returns None for animated GIFs
                 image_bytes, mime_type = prepare_image_for_gemini(image_data)
                 
                 if image_bytes is None:
-                    # Animated GIF - skip image analysis
                     log.info("Skipping animated GIF - using text-only response")
                     prompt = f"Kontekst:\n{context}\n\nOdpowiedz na ostatnia wiadomosc. Uzytkownik wyslal animowany gif, ignoruj go."
                     reply_text = get_gemini_response(prompt)
                     if not reply_text:
                         return
                 else:
-                    # Process static image
                     img = Image.open(io.BytesIO(image_bytes))
                     
                     prompt = f"Kontekst:\n{context}\n\nOdpowiedz na ostatnia wiadomosc. Mow wulgarnie i agresywnie, ale odnos sie do tresci obrazka jesli jest istotny."
@@ -1065,7 +1067,6 @@ async def handle_message(msg):
                 if not reply_text:
                     return
         else:
-            # Text only
             prompt = f"Kontekst:\n{context}\n\nOdpowiedz na ostatnia wiadomosc."
             reply_text = get_gemini_response(prompt)
             if not reply_text:
