@@ -8,6 +8,9 @@ import base64
 from dotenv import load_dotenv
 import websockets
 from curl_cffi import requests
+from PIL import Image
+import io
+import aiohttp
 
 # Import the new Google GenAI package
 from google import genai
@@ -41,6 +44,10 @@ CHUNK_DELAY = 0.1
 MAX_MESSAGES_PER_MINUTE = 10
 HISTORY_CACHE_TTL = 60
 MAX_HISTORY_PER_GUILD = 50
+
+# Avatar settings
+MAX_AVATAR_SIZE = 256 * 1024  # 256 KB max
+MAX_AVATAR_DIMENSION = 1024  # Max width/height for avatar
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("stealth-selfbot")
@@ -225,6 +232,195 @@ async def send_message(channel_id, content):
     payload = {"content": content}
     resp = await api_request("POST", url, json=payload)
     return resp.status_code == 200
+
+# --------------------------------------------
+# AVATAR HELPER - WITH RESIZING
+# --------------------------------------------
+def resize_avatar(image_data):
+    """
+    Resize and compress avatar image to fit Discord's requirements
+    - Max size: 256 KB
+    - Max dimension: 1024x1024
+    """
+    try:
+        # Open the image
+        img = Image.open(io.BytesIO(image_data))
+        
+        # Convert to RGB if needed (for PNG with alpha, etc.)
+        if img.mode in ('RGBA', 'LA', 'P'):
+            # Create a white background
+            background = Image.new('RGB', img.size, (255, 255, 255))
+            if img.mode == 'P':
+                img = img.convert('RGBA')
+            background.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
+            img = background
+        elif img.mode != 'RGB':
+            img = img.convert('RGB')
+        
+        # Resize if too large
+        width, height = img.size
+        max_dim = MAX_AVATAR_DIMENSION
+        if width > max_dim or height > max_dim:
+            ratio = min(max_dim / width, max_dim / height)
+            new_width = int(width * ratio)
+            new_height = int(height * ratio)
+            img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+            log.info(f"Resized avatar from {width}x{height} to {new_width}x{new_height}")
+        
+        # Try different quality levels to get under 256 KB
+        qualities = [85, 75, 65, 55, 45, 35, 25]
+        
+        for quality in qualities:
+            output = io.BytesIO()
+            img.save(output, format='JPEG', quality=quality, optimize=True)
+            compressed = output.getvalue()
+            
+            if len(compressed) <= MAX_AVATAR_SIZE:
+                log.info(f"Avatar compressed to {len(compressed)} bytes at quality {quality}")
+                return compressed, "image/jpeg"
+        
+        # If still too large, use lowest quality and hope for the best
+        output = io.BytesIO()
+        img.save(output, format='JPEG', quality=20, optimize=True)
+        compressed = output.getvalue()
+        log.warning(f"Avatar still {len(compressed)} bytes after max compression")
+        return compressed, "image/jpeg"
+        
+    except Exception as e:
+        log.exception(f"Error resizing avatar: {e}")
+        return None, None
+
+# --------------------------------------------
+# DISCORD SERVER JOIN + ONBOARDING
+# --------------------------------------------
+async def join_server_and_onboard(invite_code):
+    """
+    Join a Discord server using an invite code and complete onboarding
+    """
+    try:
+        # Step 1: Validate the invite first
+        log.info(f"Checking invite: {invite_code}")
+        invite_info = await api_request("GET", f"https://discord.com/api/v9/invites/{invite_code}")
+        
+        if invite_info.status_code == 404:
+            return False, "Invite invalid or expired"
+        
+        if invite_info.status_code != 200:
+            return False, f"Failed to check invite (status {invite_info.status_code})"
+        
+        invite_data = invite_info.json()
+        guild_name = invite_data.get('guild', {}).get('name', 'Unknown Server')
+        log.info(f"Found server: {guild_name}")
+        
+        # Step 2: Join the server
+        log.info(f"Attempting to join {guild_name}...")
+        join_response = await api_request(
+            "POST", 
+            f"https://discord.com/api/v9/invites/{invite_code}",
+            json={}
+        )
+        
+        if join_response.status_code == 200:
+            join_data = join_response.json()
+            guild_id = join_data.get('guild', {}).get('id')
+            channel_id = join_data.get('channel', {}).get('id')
+            
+            log.info(f"Successfully joined {guild_name} (ID: {guild_id})")
+            
+            # Step 3: Handle onboarding (if present)
+            if guild_id:
+                await complete_onboarding(guild_id)
+            
+            return True, f"Joined {guild_name} successfully!"
+        else:
+            try:
+                error = join_response.json()
+                error_msg = error.get('message', 'Unknown error')
+            except:
+                error_msg = join_response.text[:100]
+            return False, f"Failed to join: {error_msg}"
+            
+    except Exception as e:
+        log.exception(f"Error joining server: {e}")
+        return False, str(e)
+
+async def complete_onboarding(guild_id):
+    """
+    Complete onboarding for a server by fetching onboarding questions
+    and submitting random answers
+    """
+    try:
+        log.info(f"Checking onboarding for guild {guild_id}")
+        
+        # Get the onboarding data
+        onboarding_resp = await api_request(
+            "GET", 
+            f"https://discord.com/api/v9/guilds/{guild_id}/onboarding"
+        )
+        
+        if onboarding_resp.status_code != 200:
+            log.info(f"No onboarding required for guild {guild_id}")
+            return
+        
+        onboarding_data = onboarding_resp.json()
+        prompts = onboarding_data.get('prompts', [])
+        
+        if not prompts:
+            log.info(f"No onboarding prompts for guild {guild_id}")
+            return
+        
+        log.info(f"Found {len(prompts)} onboarding prompts")
+        
+        # Prepare answers for each prompt
+        answers = {}
+        for prompt in prompts:
+            prompt_id = prompt.get('id')
+            title = prompt.get('title', 'Unknown prompt')
+            options = prompt.get('options', [])
+            
+            if not options:
+                log.info(f"No options for prompt: {title}")
+                continue
+            
+            # Randomly select options for this prompt
+            is_multiple = prompt.get('type') == 1  # 1 = multiple, 0 = single
+            selected_options = []
+            
+            if is_multiple:
+                # Select random number of options (at least 1, up to half of available)
+                num_to_select = random.randint(1, max(1, len(options) // 2))
+                selected_options = random.sample(options, min(num_to_select, len(options)))
+            else:
+                # Select single random option
+                selected_options = [random.choice(options)]
+            
+            # Build answer format
+            option_ids = [opt.get('id') for opt in selected_options if opt.get('id')]
+            if option_ids:
+                answers[prompt_id] = option_ids
+                log.info(f"Selected {len(option_ids)} option(s) for prompt: {title}")
+        
+        if not answers:
+            log.info("No answers to submit for onboarding")
+            return
+        
+        # Submit onboarding answers
+        log.info(f"Submitting onboarding answers for guild {guild_id}")
+        onboarding_submit = await api_request(
+            "PUT",
+            f"https://discord.com/api/v9/guilds/{guild_id}/onboarding/answers",
+            json={
+                "answers": answers
+            }
+        )
+        
+        if onboarding_submit.status_code == 200:
+            log.info(f"Onboarding completed successfully for guild {guild_id}")
+        else:
+            log.warning(f"Failed to submit onboarding answers: {onboarding_submit.status_code}")
+            
+    except Exception as e:
+        log.exception(f"Error completing onboarding: {e}")
 
 # --------------------------------------------
 # GLOBAL STATE
@@ -453,23 +649,22 @@ async def update_prompt(new_prompt):
 # PROFILE CHANGE FUNCTIONS
 # --------------------------------------------
 async def change_avatar(image_data: bytes):
-    if len(image_data) > 256 * 1024:
-        return False, "Obraz jest za duży (max 256 KB)"
+    """Change avatar with automatic resizing"""
+    # Resize the avatar
+    resized_data, mime_type = resize_avatar(image_data)
     
-    if image_data.startswith(b'\xff\xd8'):
-        mime = "image/jpeg"
-    elif image_data.startswith(b'\x89PNG'):
-        mime = "image/png"
-    else:
-        mime = "image/png"
+    if resized_data is None:
+        return False, "Failed to process image"
     
-    b64 = base64.b64encode(image_data).decode()
-    payload = {"avatar": f"data:{mime};base64,{b64}"}
+    # Encode to base64
+    b64 = base64.b64encode(resized_data).decode()
+    payload = {"avatar": f"data:{mime_type};base64,{b64}"}
     
+    # Send request
     resp = await api_request("PATCH", "https://discord.com/api/v9/users/@me", json=payload)
     
     if resp.status_code == 200:
-        return True, "Avatar zmieniony"
+        return True, f"Avatar zmieniony! ({len(resized_data)} bytes)"
     else:
         try:
             error_data = resp.json()
@@ -568,6 +763,46 @@ async def handle_command(msg):
     cmd = parts[0].lower()
     log.info(f"Command: {cmd} from guild {current_guild}")
 
+    # --------------------------------------------
+    # .server - JOIN SERVER VIA INVITE
+    # --------------------------------------------
+    if cmd == ".server":
+        author_id = str(msg["author"]["id"])
+        if author_id not in OWNER_IDS:
+            await send_reply(channel_id, msg_id, "nie masz uprawnien")
+            return
+        
+        if len(parts) < 2:
+            await send_reply(channel_id, msg_id, "uzycie: .server <invite_code>")
+            await send_reply(channel_id, msg_id, "np: .server discord" + " (dla discord.gg/discord)")
+            return
+        
+        invite_code = parts[1].strip()
+        # Remove any URL parts if user pasted full link
+        if "discord.gg/" in invite_code:
+            invite_code = invite_code.split("discord.gg/")[-1].split("?")[0]
+        elif "discord.com/invite/" in invite_code:
+            invite_code = invite_code.split("discord.com/invite/")[-1].split("?")[0]
+        elif "discordapp.com/invite/" in invite_code:
+            invite_code = invite_code.split("discordapp.com/invite/")[-1].split("?")[0]
+        
+        # Clean up the code
+        invite_code = invite_code.split("/")[0].strip()
+        
+        if not invite_code:
+            await send_reply(channel_id, msg_id, "nieprawidlowy kod zaproszenia")
+            return
+        
+        await send_reply(channel_id, msg_id, f"próba dołączenia do serwera z kodem: {invite_code}...")
+        
+        success, message = await join_server_and_onboard(invite_code)
+        
+        if success:
+            await send_reply(channel_id, msg_id, f"✅ {message}")
+        else:
+            await send_reply(channel_id, msg_id, f"❌ {message}")
+        return
+
     if cmd == ".test" or cmd == ".ping":
         status = "ws: ok" if current_ws else "ws: None"
         await send_reply(channel_id, msg_id, f"bot zyje {status}")
@@ -599,8 +834,18 @@ async def handle_command(msg):
             await send_reply(channel_id, msg_id, "nie udalo sie przywrocic promptu")
         return
 
+    # --------------------------------------------
+    # .avatar - WITH AUTO-RESIZE
+    # --------------------------------------------
     if cmd == ".avatar":
+        author_id = str(msg["author"]["id"])
+        if author_id not in OWNER_IDS:
+            await send_reply(channel_id, msg_id, "nie masz uprawnien")
+            return
+        
         image_data = None
+        
+        # Check if image is attached
         if msg.get("attachments"):
             att = msg["attachments"][0]
             url = att["url"]
@@ -616,6 +861,7 @@ async def handle_command(msg):
                 log.exception("Failed to download attachment")
                 await send_reply(channel_id, msg_id, "nie moge pobrac zalacznika")
                 return
+        # Check if URL is provided
         elif len(parts) >= 2:
             img_url = parts[1]
             try:
@@ -638,11 +884,16 @@ async def handle_command(msg):
             await send_reply(channel_id, msg_id, "nie udalo sie pobrac obrazu")
             return
 
+        # Send initial message
+        await send_reply(channel_id, msg_id, "⏳ przetwarzanie obrazka...")
+        
+        # Change avatar with auto-resize
         success, message = await change_avatar(image_data)
+        
         if success:
-            await send_reply(channel_id, msg_id, message)
+            await send_reply(channel_id, msg_id, f"✅ {message}")
         else:
-            await send_reply(channel_id, msg_id, f"nie udalo sie: {message}")
+            await send_reply(channel_id, msg_id, f"❌ {message}")
         return
 
     if cmd == ".display":
