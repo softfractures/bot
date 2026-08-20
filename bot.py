@@ -101,18 +101,18 @@ current_system_prompt = DEFAULT_SYSTEM_PROMPT
 def get_gemini_response(prompt, image=None):
     """Get response from Gemini using the new API"""
     try:
-        system_message = f"System: {current_system_prompt}\n\nUser: {prompt}"
+        system_message = f"{current_system_prompt}\n\n{prompt}"
         
         if image:
-            if hasattr(image, 'read'):
-                image_bytes = image.read()
-            elif isinstance(image, Image.Image):
+            # If image is a PIL Image, convert to bytes
+            if isinstance(image, Image.Image):
                 img_byte_arr = io.BytesIO()
                 image.save(img_byte_arr, format='PNG')
                 image_bytes = img_byte_arr.getvalue()
             else:
                 image_bytes = image
             
+            # Upload the image
             uploaded_file = client.files.upload(
                 file=io.BytesIO(image_bytes),
                 config=types.UploadFileConfig(
@@ -120,6 +120,7 @@ def get_gemini_response(prompt, image=None):
                 )
             )
             
+            # Generate response with image
             response = client.models.generate_content(
                 model=GEMINI_MODEL,
                 contents=[
@@ -133,6 +134,7 @@ def get_gemini_response(prompt, image=None):
                 ]
             )
         else:
+            # Text only
             response = client.models.generate_content(
                 model=GEMINI_MODEL,
                 contents=system_message
@@ -144,9 +146,8 @@ def get_gemini_response(prompt, image=None):
         return None
 
 # --------------------------------------------
-# SUPPORTED IMPERSONATIONS - ONLY THESE ARE CONFIRMED TO WORK
+# SUPPORTED IMPERSONATIONS
 # --------------------------------------------
-# Based on curl_cffi documentation and common errors
 SUPPORTED_IMPERSONATIONS = ["chrome120", "chrome123", "chrome124"]
 
 def get_supported_impersonate():
@@ -199,7 +200,7 @@ def get_dynamic_headers():
     }
 
 # --------------------------------------------
-# ASYNC API REQUEST - WITH RETRY ON IMPERSONATION ERROR
+# ASYNC API REQUEST
 # --------------------------------------------
 session = requests.Session()
 session.impersonate = "chrome120"
@@ -211,8 +212,6 @@ async def api_request(method, url, **kwargs):
             if 'headers' in kwargs:
                 headers.update(kwargs.pop('headers'))
             
-            # Use a stable impersonation - don't change it randomly
-            # to avoid unsupported impersonation errors
             session.impersonate = "chrome120"
             
             resp = await asyncio.to_thread(session.request, method, url, headers=headers, **kwargs)
@@ -224,14 +223,12 @@ async def api_request(method, url, **kwargs):
                 continue
             return resp
             
-        except requests.exceptions.RequestException as e:
+        except Exception as e:
             if "ImpersonateError" in str(e) or "impersonate" in str(e).lower():
                 log.warning(f"Impersonation error: {e}, retrying with chrome120")
                 session.impersonate = "chrome120"
                 await asyncio.sleep(1)
                 continue
-            raise e
-        except Exception as e:
             log.exception(f"API request error: {e}")
             await asyncio.sleep(2)
             continue
@@ -315,6 +312,7 @@ def prepare_image_for_gemini(image_data):
     """Prepare image for Gemini API - returns None for animated GIFs"""
     try:
         with Image.open(io.BytesIO(image_data)) as img:
+            # Always convert to RGB and PNG for consistency
             if getattr(img, 'format', '').upper() == 'GIF':
                 is_animated = getattr(img, 'is_animated', False)
                 
@@ -352,12 +350,10 @@ def prepare_image_for_gemini(image_data):
                     img.convert('RGB').save(output, format='PNG')
                     return output.getvalue(), "image/png"
             
-            if image_data.startswith(b'\xff\xd8'):
-                return image_data, "image/jpeg"
-            elif image_data.startswith(b'\x89PNG'):
-                return image_data, "image/png"
-            else:
-                return image_data, "image/jpeg"
+            # For any other format, convert to PNG for consistency
+            output = io.BytesIO()
+            img.convert('RGB').save(output, format='PNG')
+            return output.getvalue(), "image/png"
                 
     except Exception as e:
         log.warning(f"Error preparing image: {e}")
@@ -463,19 +459,25 @@ async def build_context(channel_id, current_msg, guild_id=None):
     
     has_image = False
     image_data = None
+    
+    # Check attachments in the current message
     if current_msg.get("attachments"):
         for att in current_msg["attachments"]:
             content_type = att.get("content_type", "")
             if content_type.startswith("image/"):
+                log.info(f"Found image attachment: {att['filename']} with type {content_type}")
                 image_data = await download_image(att["url"])
                 if image_data:
+                    log.info(f"Downloaded image: {len(image_data)} bytes")
                     if is_static_image(image_data):
                         has_image = True
-                        log.info(f"Found static image in message: {att['filename']}")
+                        log.info(f"✓ Static image detected: {att['filename']}")
                         break
                     else:
-                        log.info(f"Skipping non-static or animated image: {att['filename']}")
+                        log.info(f"✗ Skipping animated image: {att['filename']}")
                         image_data = None
+                else:
+                    log.warning(f"Failed to download image: {att['filename']}")
     
     for m in reversed(channel_msgs):
         author = m["author"].get("global_name") or m["author"]["username"]
@@ -509,8 +511,10 @@ async def build_context(channel_id, current_msg, guild_id=None):
     lines.append(f"{author}: {current_msg['content']}")
     
     if has_image and image_data:
+        log.info("Returning context with image")
         return "\n".join(lines), image_data
     
+    log.info("Returning context without image")
     return "\n".join(lines), None
 
 # --------------------------------------------
@@ -1042,6 +1046,7 @@ async def handle_message(msg):
 
     try:
         if image_data:
+            log.info("Processing message with image")
             try:
                 image_bytes, mime_type = prepare_image_for_gemini(image_data)
                 
@@ -1052,6 +1057,7 @@ async def handle_message(msg):
                     if not reply_text:
                         return
                 else:
+                    log.info(f"Processing static image: {len(image_bytes)} bytes")
                     img = Image.open(io.BytesIO(image_bytes))
                     
                     prompt = f"Kontekst:\n{context}\n\nOdpowiedz na ostatnia wiadomosc. Mow wulgarnie i agresywnie, ale odnos sie do tresci obrazka jesli jest istotny."
@@ -1060,6 +1066,7 @@ async def handle_message(msg):
                     if not reply_text:
                         log.info("Gemini returned empty response - skipping reply.")
                         return
+                    log.info(f"Gemini response: {reply_text[:100]}...")
             except Exception as e:
                 log.exception(f"Error processing image with Gemini: {e}")
                 prompt = f"Kontekst:\n{context}\n\nOdpowiedz na ostatnia wiadomosc. Uzytkownik wyslal obrazek ale nie moge go przeczytac. Odpowiedz wulgarnie i agresywnie."
@@ -1067,6 +1074,7 @@ async def handle_message(msg):
                 if not reply_text:
                     return
         else:
+            log.info("Processing text-only message")
             prompt = f"Kontekst:\n{context}\n\nOdpowiedz na ostatnia wiadomosc."
             reply_text = get_gemini_response(prompt)
             if not reply_text:
@@ -1076,6 +1084,7 @@ async def handle_message(msg):
         log.exception("AI failed - skipping reply.")
         return
 
+    # Send the response
     for i in range(0, len(reply_text), 1900):
         chunk = reply_text[i:i+1900]
         await send_reply(channel_id, msg_id, chunk)
