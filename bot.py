@@ -23,7 +23,7 @@ load_dotenv()
 # --------------------------------------------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")  # Changed to 2.5 flash as default
 
 # Multiple owners
 OWNER_IDS = [
@@ -80,9 +80,18 @@ def fetch_latest_build_info():
 LATEST_BUILD, LATEST_VERSION = fetch_latest_build_info()
 
 # --------------------------------------------
-# GEMINI SETUP
+# GEMINI SETUP - WITH FALLBACK MODELS
 # --------------------------------------------
 client = genai.Client(api_key=GEMINI_API_KEY)
+
+# List of models to try in order (some may be overloaded)
+AVAILABLE_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-2.5-pro",
+    "gemini-2.0-pro",
+    "gemini-3.6-flash",
+]
 
 DEFAULT_SYSTEM_PROMPT = (
 "jestes wulgarnym agresywnym botem discord\n"
@@ -103,25 +112,50 @@ DEFAULT_SYSTEM_PROMPT = (
 current_system_prompt = DEFAULT_SYSTEM_PROMPT
 
 def get_gemini_response(prompt):
-    """Get response from Gemini"""
-    try:
-        system_message = f"{current_system_prompt}\n\n{prompt}"
+    """Get response from Gemini with fallback models and retry logic"""
+    # Models to try: first try the configured one, then fallbacks
+    models_to_try = [GEMINI_MODEL] + [m for m in AVAILABLE_MODELS if m != GEMINI_MODEL]
+    
+    for model_name in models_to_try:
+        for attempt in range(3):  # 3 attempts per model
+            try:
+                system_message = f"{current_system_prompt}\n\n{prompt}"
+                
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=system_message,
+                    config=types.GenerateContentConfig(
+                        temperature=0.9,
+                        max_output_tokens=150,
+                        top_p=0.95,
+                        top_k=40,
+                    )
+                )
+                
+                if response.text:
+                    log.info(f"Used model: {model_name}")
+                    return response.text
+                
+            except Exception as e:
+                error_str = str(e)
+                if "503" in error_str or "UNAVAILABLE" in error_str:
+                    wait_time = 2 ** attempt
+                    log.warning(f"Model {model_name} overloaded (attempt {attempt+1}/3). Waiting {wait_time}s...")
+                    time.sleep(wait_time)
+                    continue
+                elif "404" in error_str or "not found" in error_str.lower():
+                    log.warning(f"Model {model_name} not found, trying next...")
+                    break
+                else:
+                    log.exception(f"Gemini API error with {model_name}: {e}")
+                    return None
         
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=system_message,
-            config=types.GenerateContentConfig(
-                temperature=0.9,
-                max_output_tokens=150,
-                top_p=0.95,
-                top_k=40,
-            )
-        )
-        
-        return response.text if response.text else None
-    except Exception as e:
-        log.exception(f"Gemini API error: {e}")
-        return None
+        # If we got here, this model failed all attempts
+        log.warning(f"All attempts with {model_name} failed, trying next model...")
+        continue
+    
+    log.error("All models failed, no response generated")
+    return None
 
 # --------------------------------------------
 # SUPPORTED IMPERSONATIONS
@@ -514,7 +548,7 @@ async def get_cached_channel_history(channel_id, before_id):
     return []
 
 # --------------------------------------------
-# CONTEXT BUILDER
+# CONTEXT BUILDER - IGNORES ATTACHMENTS
 # --------------------------------------------
 async def build_context(channel_id, current_msg, guild_id=None):
     lines = []
@@ -522,7 +556,14 @@ async def build_context(channel_id, current_msg, guild_id=None):
     
     for m in reversed(channel_msgs):
         author = m["author"].get("global_name") or m["author"]["username"]
-        lines.append(f"{author}: {m['content']}")
+        # Only use text content, ignore attachments completely
+        content = m.get("content", "")
+        if content:
+            lines.append(f"{author}: {content}")
+        else:
+            # If message has no text but has attachments, just show that they sent something
+            if m.get("attachments"):
+                lines.append(f"{author}: [wyslal zalacznik]")
     
     if guild_id:
         guild_key = f"guild_{guild_id}"
@@ -538,7 +579,14 @@ async def build_context(channel_id, current_msg, guild_id=None):
             lines.append(f"[Reply to] {author}: {ref['content']}")
     
     author = current_msg["author"].get("global_name") or current_msg["author"]["username"]
-    lines.append(f"{author}: {current_msg['content']}")
+    content = current_msg.get("content", "")
+    if content:
+        lines.append(f"{author}: {content}")
+    else:
+        # If the current message has no text but has attachments
+        if current_msg.get("attachments"):
+            lines.append(f"{author}: [wyslal zalacznik]")
+    
     return "\n".join(lines)
 
 # --------------------------------------------
@@ -1073,6 +1121,7 @@ async def handle_message(msg):
         log.debug(f"Ignoring user {author_id}")
         return
 
+    # Handle commands
     if content.startswith("."):
         if author_id in OWNER_IDS or (self_user_id and author_id == self_user_id):
             await handle_command(msg)
@@ -1092,6 +1141,7 @@ async def handle_message(msg):
     channel_type = msg.get("channel_type")
     is_dm = channel_type in ("DM", "GROUP_DM")
     
+    # Only respond if mentioned, replied to, or DM
     if not (mentioned or replied or is_dm):
         return
 
@@ -1101,14 +1151,15 @@ async def handle_message(msg):
 
     await send_typing(channel_id)
     
+    # Build context - this now ignores attachment content
     context = await build_context(channel_id, msg, guild_id)
     
     author_name = msg["author"].get("global_name") or msg["author"]["username"]
     timestamp = time.time()
     if guild_id:
-        add_to_guild_history(f"guild_{guild_id}", author_name, msg["content"], msg_id, timestamp)
+        add_to_guild_history(f"guild_{guild_id}", author_name, content, msg_id, timestamp)
     else:
-        add_to_guild_history(f"dm_{channel_id}", author_name, msg["content"], msg_id, timestamp)
+        add_to_guild_history(f"dm_{channel_id}", author_name, content, msg_id, timestamp)
 
     try:
         prompt = f"Kontekst:\n{context}\n\nOdpowiedz na ostatnia wiadomosc."
@@ -1160,7 +1211,9 @@ async def filter_and_queue(msg):
     if msg.get("referenced_message"):
         ref = msg["referenced_message"]
         if ref.get("author", {}).get("id") == self_user_id:
-            replied = True    
+            replied = True
+    
+    # We want to respond to mentions and replies, even if they have attachments
     if mentioned or replied:
         await message_queue.put(msg)
 
