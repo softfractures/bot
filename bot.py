@@ -45,6 +45,11 @@ MAX_MESSAGES_PER_MINUTE = 10
 HISTORY_CACHE_TTL = 60
 MAX_HISTORY_PER_GUILD = 50
 
+# Image compression settings
+MAX_IMAGE_SIZE = 1024 * 1024  # 1MB max after compression
+IMAGE_QUALITY = 85  # JPEG quality (1-100)
+MAX_IMAGE_DIMENSION = 1024  # Max width/height
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("stealth-selfbot")
 
@@ -98,6 +103,48 @@ DEFAULT_SYSTEM_PROMPT = (
 
 current_system_prompt = DEFAULT_SYSTEM_PROMPT
 
+def compress_image(image_bytes, max_size=MAX_IMAGE_SIZE, max_dimension=MAX_IMAGE_DIMENSION, quality=IMAGE_QUALITY):
+    """Compress image to reduce size while maintaining quality"""
+    try:
+        # Open image
+        img = Image.open(io.BytesIO(image_bytes))
+        
+        # Convert to RGB if needed
+        if img.mode in ('RGBA', 'LA', 'P'):
+            img = img.convert('RGB')
+        
+        # Resize if too large
+        width, height = img.size
+        if width > max_dimension or height > max_dimension:
+            ratio = min(max_dimension / width, max_dimension / height)
+            new_width = int(width * ratio)
+            new_height = int(height * ratio)
+            img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+            log.info(f"Resized image from {width}x{height} to {new_width}x{new_height}")
+        
+        # Compress by saving as JPEG with quality
+        output = io.BytesIO()
+        img.save(output, format='JPEG', quality=quality, optimize=True)
+        compressed = output.getvalue()
+        
+        # If still too large, reduce quality further
+        if len(compressed) > max_size:
+            log.info(f"Image still too large ({len(compressed)} bytes), reducing quality")
+            for q in range(quality - 10, 40, -5):
+                output = io.BytesIO()
+                img.save(output, format='JPEG', quality=q, optimize=True)
+                compressed = output.getvalue()
+                if len(compressed) <= max_size:
+                    log.info(f"Compressed to {len(compressed)} bytes with quality {q}")
+                    break
+        
+        log.info(f"Compressed image from {len(image_bytes)} to {len(compressed)} bytes")
+        return compressed
+        
+    except Exception as e:
+        log.warning(f"Image compression failed: {e}, using original")
+        return image_bytes
+
 def get_gemini_response(prompt, image=None):
     """Get response from Gemini using the new API"""
     try:
@@ -112,11 +159,14 @@ def get_gemini_response(prompt, image=None):
             else:
                 image_bytes = image
             
-            # Upload the image
+            # Compress the image
+            image_bytes = compress_image(image_bytes)
+            
+            # Upload the compressed image
             uploaded_file = client.files.upload(
                 file=io.BytesIO(image_bytes),
                 config=types.UploadFileConfig(
-                    mime_type="image/png"
+                    mime_type="image/jpeg"  # Using JPEG after compression
                 )
             )
             
@@ -256,7 +306,7 @@ async def send_message(channel_id, content):
     return resp.status_code == 200
 
 # --------------------------------------------
-# IMAGE ANALYSIS HELPERS - NO GIF SUPPORT
+# IMAGE ANALYSIS HELPERS - No GIF support
 # --------------------------------------------
 def is_supported_image_format(image_data):
     """Check if image is a supported format (PNG, JPG, JPEG, WEBP)"""
@@ -282,14 +332,40 @@ async def download_image(url):
     return None
 
 def prepare_image_for_gemini(image_data):
-    """Prepare image for Gemini API - PNG, JPG, WEBP only"""
+    """Prepare image for Gemini API - compress and convert to JPEG"""
     try:
         with Image.open(io.BytesIO(image_data)) as img:
-            # Convert to PNG for consistency
+            # Convert to RGB if needed
+            if img.mode in ('RGBA', 'LA', 'P'):
+                img = img.convert('RGB')
+            
+            # Resize if too large
+            width, height = img.size
+            max_dim = MAX_IMAGE_DIMENSION
+            if width > max_dim or height > max_dim:
+                ratio = min(max_dim / width, max_dim / height)
+                new_width = int(width * ratio)
+                new_height = int(height * ratio)
+                img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                log.info(f"Resized image from {width}x{height} to {new_width}x{new_height}")
+            
+            # Compress to JPEG
             output = io.BytesIO()
-            img.convert('RGB').save(output, format='PNG')
-            log.info(f"Converted {img.format} to PNG for Gemini")
-            return output.getvalue(), "image/png"
+            img.save(output, format='JPEG', quality=IMAGE_QUALITY, optimize=True)
+            compressed = output.getvalue()
+            
+            # If still too large, reduce quality
+            if len(compressed) > MAX_IMAGE_SIZE:
+                for q in range(IMAGE_QUALITY - 10, 40, -5):
+                    output = io.BytesIO()
+                    img.save(output, format='JPEG', quality=q, optimize=True)
+                    compressed = output.getvalue()
+                    if len(compressed) <= MAX_IMAGE_SIZE:
+                        log.info(f"Compressed to {len(compressed)} bytes with quality {q}")
+                        break
+            
+            log.info(f"Prepared image: {len(compressed)} bytes (original: {len(image_data)})")
+            return compressed, "image/jpeg"
     except Exception as e:
         log.warning(f"Error preparing image: {e}")
         return None, None
@@ -988,6 +1064,7 @@ async def handle_message(msg):
         if image_data:
             log.info("Processing message with image")
             try:
+                # Prepare and compress image
                 image_bytes, mime_type = prepare_image_for_gemini(image_data)
                 
                 if image_bytes is None:
@@ -997,7 +1074,7 @@ async def handle_message(msg):
                     if not reply_text:
                         return
                 else:
-                    log.info(f"Processing image: {len(image_bytes)} bytes")
+                    log.info(f"Processing compressed image: {len(image_bytes)} bytes")
                     img = Image.open(io.BytesIO(image_bytes))
                     
                     prompt = f"Kontekst:\n{context}\n\nOdpowiedz na ostatnia wiadomosc. Mow wulgarnie i agresywnie, ale odnos sie do tresci obrazka jesli jest istotny."
