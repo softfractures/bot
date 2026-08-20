@@ -5,16 +5,20 @@ import logging
 import random
 import time
 import base64
+import aiohttp
+import google.generativeai as genai
 from dotenv import load_dotenv
 import websockets
 from curl_cffi import requests
-from PIL import Image
-import io
-import aiohttp
 
-# Import the new Google GenAI package
-from google import genai
-from google.genai import types
+# ---- NOWY IMPORT ----
+try:
+    from PIL import Image
+    import io
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
+    print("UWAGA: Pillow nie jest zainstalowane – funkcja resize nie będzie działać!")
 
 load_dotenv()
 
@@ -23,7 +27,7 @@ load_dotenv()
 # --------------------------------------------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")  # Changed to 2.5 flash as default
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
 # Multiple owners
 OWNER_IDS = [
@@ -37,17 +41,13 @@ SPONTANEOUS_COOLDOWN = 180
 SPONTANEOUS_CHECK_INTERVAL = 60
 SPONTANEOUS_CHANNEL_ID = "1458080496369139849"
 
-# Faster delays
-MIN_REPLY_DELAY = 0.5
-MAX_REPLY_DELAY = 1.0
-CHUNK_DELAY = 0.1
-MAX_MESSAGES_PER_MINUTE = 10
+# Faster delays – dostosowane do szybszego odpowiadania
+MIN_REPLY_DELAY = 0.5          # wcześniej 2.0
+MAX_REPLY_DELAY = 1.0          # wcześniej 4.0
+CHUNK_DELAY = 0.1              # wcześniej 0.5
+MAX_MESSAGES_PER_MINUTE = 10   # ustawione na 10 (prośba użytkownika)
 HISTORY_CACHE_TTL = 60
 MAX_HISTORY_PER_GUILD = 50
-
-# Avatar settings
-MAX_AVATAR_SIZE = 256 * 1024  # 256 KB max
-MAX_AVATAR_DIMENSION = 1024  # Max width/height for avatar
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("stealth-selfbot")
@@ -80,110 +80,38 @@ def fetch_latest_build_info():
 LATEST_BUILD, LATEST_VERSION = fetch_latest_build_info()
 
 # --------------------------------------------
-# GEMINI SETUP - WITH FALLBACK MODELS
+# GEMINI SETUP
 # --------------------------------------------
-client = genai.Client(api_key=GEMINI_API_KEY)
-
-# List of models to try in order (some may be overloaded)
-AVAILABLE_MODELS = [
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
-    "gemini-2.5-pro",
-    "gemini-2.0-pro",
-    "gemini-3.6-flash",
-]
+genai.configure(api_key=GEMINI_API_KEY)
 
 DEFAULT_SYSTEM_PROMPT = (
-"jestes wulgarnym agresywnym botem discord\n"
-"piszesz tylko malymi literami\n"
-"prawie bez interpunkcji\n"
-"odpowiadasz bardzo krotko ostro i z jadem\n"
-"uzywasz mocnych wulgaryzmow i personalnych atakow\n"
-"w normalnych odpowiedziach absolutnie nigdy nie uzywasz zadnych emotek\n"
-"zawsze odpowiadaj na temat tego co napisal rozmowca\n"
-"nie odlatuj w losowe obelgi tylko odnos sie do jego wiadomosci\n"
-"kazda wiadomosc traktujesz jak prowokacje i od razu atakujesz\n"
-"nie tlumaczysz sie nie lagodzis\n"
-"maksymalnie 1-2 krotkie zdania\n"
-"nie uzywasz polskich znakow\n"
-"zawsze pisz ze spacjami miedzy slowami nigdy nie sklejaj slow ze soba"
+"jesteś wulgarnym agresywnym botem discord"
+"piszesz tylko małymi literami"
+"prawie bez interpunkcji"
+"odpowiadasz bardzo krótko ostro i z jadem"
+"używasz mocnych wulgaryzmów i personalnych ataków"
+"absolutnie nigdy nie używasz żadnych emotek"
+"zawsze odpowiadaj na temat tego co napisał rozmówca"
+"nie odlatuj w losowe obelgi tylko odnoś się do jego wiadomości"
+"każdą wiadomość traktujesz jak prowokację i od razu atakujesz"
+"nie tłumaczysz się nie łagodzisz"
+"maksymalnie 1-2 krótkie zdania"
+"nie uzywasz polskich znakow (a zamiast a, e zamiast e, c zamiast c, l zamiast l, n zamiast n, o zamiast o, s zamiast s, z zamiast z, z zamiast z)"
 )
 
 current_system_prompt = DEFAULT_SYSTEM_PROMPT
-
-def get_gemini_response(prompt):
-    """Get response from Gemini with fallback models and retry logic"""
-    # Models to try: first try the configured one, then fallbacks
-    models_to_try = [GEMINI_MODEL] + [m for m in AVAILABLE_MODELS if m != GEMINI_MODEL]
-    
-    for model_name in models_to_try:
-        for attempt in range(3):  # 3 attempts per model
-            try:
-                system_message = f"{current_system_prompt}\n\n{prompt}"
-                
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=system_message,
-                    config=types.GenerateContentConfig(
-                        temperature=0.9,
-                        max_output_tokens=150,
-                        top_p=0.95,
-                        top_k=40,
-                    )
-                )
-                
-                if response.text:
-                    log.info(f"Used model: {model_name}")
-                    return response.text
-                
-            except Exception as e:
-                error_str = str(e)
-                if "503" in error_str or "UNAVAILABLE" in error_str:
-                    wait_time = 2 ** attempt
-                    log.warning(f"Model {model_name} overloaded (attempt {attempt+1}/3). Waiting {wait_time}s...")
-                    time.sleep(wait_time)
-                    continue
-                elif "404" in error_str or "not found" in error_str.lower():
-                    log.warning(f"Model {model_name} not found, trying next...")
-                    break
-                else:
-                    log.exception(f"Gemini API error with {model_name}: {e}")
-                    return None
-        
-        # If we got here, this model failed all attempts
-        log.warning(f"All attempts with {model_name} failed, trying next model...")
-        continue
-    
-    log.error("All models failed, no response generated")
-    return None
+model = genai.GenerativeModel(GEMINI_MODEL, system_instruction=current_system_prompt)
 
 # --------------------------------------------
-# SUPPORTED IMPERSONATIONS
+# DYNAMIC HEADER GENERATION
 # --------------------------------------------
-SUPPORTED_IMPERSONATIONS = ["chrome120", "chrome123", "chrome124"]
-
-def get_supported_impersonate():
-    return random.choice(SUPPORTED_IMPERSONATIONS)
-
-def get_random_user_agent():
-    user_agents = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    ]
-    return random.choice(user_agents)
-
 def get_dynamic_headers():
-    user_agent = get_random_user_agent()
-    build_variation = random.randint(-50, 50)
-    current_build = LATEST_BUILD + build_variation
-    
     properties = {
         "os": "Windows",
         "browser": "Chrome",
         "device": "",
         "system_locale": "en-US",
-        "browser_user_agent": user_agent,
+        "browser_user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "browser_version": "120.0.6099.216",
         "os_version": "10.0.19045",
         "referrer": "",
@@ -191,14 +119,13 @@ def get_dynamic_headers():
         "referrer_current": "",
         "referring_domain_current": "",
         "release_channel": "stable",
-        "client_build_number": current_build,
+        "client_build_number": LATEST_BUILD,
         "client_event_source": None
     }
     super_properties = base64.b64encode(json.dumps(properties, separators=(',', ':')).encode()).decode()
-    
     return {
         "Authorization": DISCORD_TOKEN,
-        "User-Agent": user_agent,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "X-Super-Properties": super_properties,
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9",
@@ -206,9 +133,7 @@ def get_dynamic_headers():
         "Connection": "keep-alive",
         "Sec-Fetch-Dest": "empty",
         "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "same-origin",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
+        "Sec-Fetch-Site": "same-origin"
     }
 
 # --------------------------------------------
@@ -219,31 +144,16 @@ session.impersonate = "chrome120"
 
 async def api_request(method, url, **kwargs):
     while True:
-        try:
-            headers = get_dynamic_headers()
-            if 'headers' in kwargs:
-                headers.update(kwargs.pop('headers'))
-            
-            session.impersonate = "chrome120"
-            
-            resp = await asyncio.to_thread(session.request, method, url, headers=headers, **kwargs)
-            
-            if resp.status_code == 429:
-                retry = resp.json().get('retry_after', 2)
-                log.warning(f"Rate limited. Sleeping {retry}s")
-                await asyncio.sleep(retry + 0.5)
-                continue
-            return resp
-            
-        except Exception as e:
-            if "ImpersonateError" in str(e) or "impersonate" in str(e).lower():
-                log.warning(f"Impersonation error: {e}, retrying with chrome120")
-                session.impersonate = "chrome120"
-                await asyncio.sleep(1)
-                continue
-            log.exception(f"API request error: {e}")
-            await asyncio.sleep(2)
+        headers = get_dynamic_headers()
+        if 'headers' in kwargs:
+            headers.update(kwargs.pop('headers'))
+        resp = await asyncio.to_thread(session.request, method, url, headers=headers, **kwargs)
+        if resp.status_code == 429:
+            retry = resp.json().get('retry_after', 2)
+            log.warning(f"Rate limited. Sleeping {retry}s")
+            await asyncio.sleep(retry + 0.5)
             continue
+        return resp
 
 # --------------------------------------------
 # ASYNC HELPERS
@@ -268,195 +178,6 @@ async def send_message(channel_id, content):
     return resp.status_code == 200
 
 # --------------------------------------------
-# AVATAR HELPER - WITH RESIZING
-# --------------------------------------------
-def resize_avatar(image_data):
-    """
-    Resize and compress avatar image to fit Discord's requirements
-    - Max size: 256 KB
-    - Max dimension: 1024x1024
-    """
-    try:
-        # Open the image
-        img = Image.open(io.BytesIO(image_data))
-        
-        # Convert to RGB if needed (for PNG with alpha, etc.)
-        if img.mode in ('RGBA', 'LA', 'P'):
-            # Create a white background
-            background = Image.new('RGB', img.size, (255, 255, 255))
-            if img.mode == 'P':
-                img = img.convert('RGBA')
-            background.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
-            img = background
-        elif img.mode != 'RGB':
-            img = img.convert('RGB')
-        
-        # Resize if too large
-        width, height = img.size
-        max_dim = MAX_AVATAR_DIMENSION
-        if width > max_dim or height > max_dim:
-            ratio = min(max_dim / width, max_dim / height)
-            new_width = int(width * ratio)
-            new_height = int(height * ratio)
-            img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-            log.info(f"Resized avatar from {width}x{height} to {new_width}x{new_height}")
-        
-        # Try different quality levels to get under 256 KB
-        qualities = [85, 75, 65, 55, 45, 35, 25]
-        
-        for quality in qualities:
-            output = io.BytesIO()
-            img.save(output, format='JPEG', quality=quality, optimize=True)
-            compressed = output.getvalue()
-            
-            if len(compressed) <= MAX_AVATAR_SIZE:
-                log.info(f"Avatar compressed to {len(compressed)} bytes at quality {quality}")
-                return compressed, "image/jpeg"
-        
-        # If still too large, use lowest quality and hope for the best
-        output = io.BytesIO()
-        img.save(output, format='JPEG', quality=20, optimize=True)
-        compressed = output.getvalue()
-        log.warning(f"Avatar still {len(compressed)} bytes after max compression")
-        return compressed, "image/jpeg"
-        
-    except Exception as e:
-        log.exception(f"Error resizing avatar: {e}")
-        return None, None
-
-# --------------------------------------------
-# DISCORD SERVER JOIN + ONBOARDING
-# --------------------------------------------
-async def join_server_and_onboard(invite_code):
-    """
-    Join a Discord server using an invite code and complete onboarding
-    """
-    try:
-        # Step 1: Validate the invite first
-        log.info(f"Checking invite: {invite_code}")
-        invite_info = await api_request("GET", f"https://discord.com/api/v9/invites/{invite_code}")
-        
-        if invite_info.status_code == 404:
-            return False, "Invite invalid or expired"
-        
-        if invite_info.status_code != 200:
-            return False, f"Failed to check invite (status {invite_info.status_code})"
-        
-        invite_data = invite_info.json()
-        guild_name = invite_data.get('guild', {}).get('name', 'Unknown Server')
-        log.info(f"Found server: {guild_name}")
-        
-        # Step 2: Join the server
-        log.info(f"Attempting to join {guild_name}...")
-        join_response = await api_request(
-            "POST", 
-            f"https://discord.com/api/v9/invites/{invite_code}",
-            json={}
-        )
-        
-        if join_response.status_code == 200:
-            join_data = join_response.json()
-            guild_id = join_data.get('guild', {}).get('id')
-            channel_id = join_data.get('channel', {}).get('id')
-            
-            log.info(f"Successfully joined {guild_name} (ID: {guild_id})")
-            
-            # Step 3: Handle onboarding (if present)
-            if guild_id:
-                await complete_onboarding(guild_id)
-            
-            return True, f"Joined {guild_name} successfully!"
-        else:
-            try:
-                error = join_response.json()
-                error_msg = error.get('message', 'Unknown error')
-            except:
-                error_msg = join_response.text[:100]
-            return False, f"Failed to join: {error_msg}"
-            
-    except Exception as e:
-        log.exception(f"Error joining server: {e}")
-        return False, str(e)
-
-async def complete_onboarding(guild_id):
-    """
-    Complete onboarding for a server by fetching onboarding questions
-    and submitting random answers
-    """
-    try:
-        log.info(f"Checking onboarding for guild {guild_id}")
-        
-        # Get the onboarding data
-        onboarding_resp = await api_request(
-            "GET", 
-            f"https://discord.com/api/v9/guilds/{guild_id}/onboarding"
-        )
-        
-        if onboarding_resp.status_code != 200:
-            log.info(f"No onboarding required for guild {guild_id}")
-            return
-        
-        onboarding_data = onboarding_resp.json()
-        prompts = onboarding_data.get('prompts', [])
-        
-        if not prompts:
-            log.info(f"No onboarding prompts for guild {guild_id}")
-            return
-        
-        log.info(f"Found {len(prompts)} onboarding prompts")
-        
-        # Prepare answers for each prompt
-        answers = {}
-        for prompt in prompts:
-            prompt_id = prompt.get('id')
-            title = prompt.get('title', 'Unknown prompt')
-            options = prompt.get('options', [])
-            
-            if not options:
-                log.info(f"No options for prompt: {title}")
-                continue
-            
-            # Randomly select options for this prompt
-            is_multiple = prompt.get('type') == 1  # 1 = multiple, 0 = single
-            selected_options = []
-            
-            if is_multiple:
-                # Select random number of options (at least 1, up to half of available)
-                num_to_select = random.randint(1, max(1, len(options) // 2))
-                selected_options = random.sample(options, min(num_to_select, len(options)))
-            else:
-                # Select single random option
-                selected_options = [random.choice(options)]
-            
-            # Build answer format
-            option_ids = [opt.get('id') for opt in selected_options if opt.get('id')]
-            if option_ids:
-                answers[prompt_id] = option_ids
-                log.info(f"Selected {len(option_ids)} option(s) for prompt: {title}")
-        
-        if not answers:
-            log.info("No answers to submit for onboarding")
-            return
-        
-        # Submit onboarding answers
-        log.info(f"Submitting onboarding answers for guild {guild_id}")
-        onboarding_submit = await api_request(
-            "PUT",
-            f"https://discord.com/api/v9/guilds/{guild_id}/onboarding/answers",
-            json={
-                "answers": answers
-            }
-        )
-        
-        if onboarding_submit.status_code == 200:
-            log.info(f"Onboarding completed successfully for guild {guild_id}")
-        else:
-            log.warning(f"Failed to submit onboarding answers: {onboarding_submit.status_code}")
-            
-    except Exception as e:
-        log.exception(f"Error completing onboarding: {e}")
-
-# --------------------------------------------
 # GLOBAL STATE
 # --------------------------------------------
 self_user_id = None
@@ -475,36 +196,45 @@ guild_histories = {}
 channel_history_cache = {}
 
 # --------------------------------------------
-# IGNORE / SPAM DETECTION
+# IGNORE / SPAM DETECTION (NEW)
 # --------------------------------------------
-ignored_users = {}
-mention_timestamps = {}
-SPAM_WINDOW = 5
-SPAM_THRESHOLD = 5
-AUTO_IGNORE_DURATION = 3600
+ignored_users = {}               # user_id -> expiry_timestamp (0 = permanent)
+mention_timestamps = {}          # user_id -> list of timestamps (for spam detection)
+SPAM_WINDOW = 5                  # seconds
+SPAM_THRESHOLD = 5               # mentions/replies in window
+AUTO_IGNORE_DURATION = 3600      # 1 hour
 
 def is_ignored(user_id):
+    """Check if user is currently ignored (including expiry)."""
     if user_id not in ignored_users:
         return False
     expiry = ignored_users[user_id]
-    if expiry == 0:
+    if expiry == 0:  # permanent
         return True
     if time.time() < expiry:
         return True
+    # expired
     del ignored_users[user_id]
     return False
 
 def check_mention_spam(user_id):
+    """
+    Update mention timestamps and return True if spam threshold is exceeded.
+    If exceeded, automatically ignore the user for AUTO_IGNORE_DURATION.
+    """
     now = time.time()
     if user_id not in mention_timestamps:
         mention_timestamps[user_id] = []
     timestamps = mention_timestamps[user_id]
+    # Remove old entries
     timestamps = [t for t in timestamps if now - t <= SPAM_WINDOW]
     timestamps.append(now)
     mention_timestamps[user_id] = timestamps
     if len(timestamps) >= SPAM_THRESHOLD:
+        # Auto-ignore
         ignored_users[user_id] = now + AUTO_IGNORE_DURATION
         log.info(f"Auto-ignored user {user_id} for {AUTO_IGNORE_DURATION}s due to spam")
+        # Optionally clean up mention timestamps to avoid repeated triggers
         mention_timestamps[user_id] = []
         return True
     return False
@@ -548,22 +278,14 @@ async def get_cached_channel_history(channel_id, before_id):
     return []
 
 # --------------------------------------------
-# CONTEXT BUILDER - IGNORES ATTACHMENTS
+# CONTEXT BUILDER (async)
 # --------------------------------------------
 async def build_context(channel_id, current_msg, guild_id=None):
     lines = []
     channel_msgs = await get_cached_channel_history(channel_id, current_msg["id"])
-    
     for m in reversed(channel_msgs):
         author = m["author"].get("global_name") or m["author"]["username"]
-        # Only use text content, ignore attachments completely
-        content = m.get("content", "")
-        if content:
-            lines.append(f"{author}: {content}")
-        else:
-            # If message has no text but has attachments, just show that they sent something
-            if m.get("attachments"):
-                lines.append(f"{author}: [wyslal zalacznik]")
+        lines.append(f"{author}: {m['content']}")
     
     if guild_id:
         guild_key = f"guild_{guild_id}"
@@ -579,24 +301,18 @@ async def build_context(channel_id, current_msg, guild_id=None):
             lines.append(f"[Reply to] {author}: {ref['content']}")
     
     author = current_msg["author"].get("global_name") or current_msg["author"]["username"]
-    content = current_msg.get("content", "")
-    if content:
-        lines.append(f"{author}: {content}")
-    else:
-        # If the current message has no text but has attachments
-        if current_msg.get("attachments"):
-            lines.append(f"{author}: [wyslal zalacznik]")
-    
+    lines.append(f"{author}: {current_msg['content']}")
     return "\n".join(lines)
 
 # --------------------------------------------
 # SPONTANEOUS MESSAGES
 # --------------------------------------------
 SPONTANEOUS_PROMPTS = [
-    "napisz wulgarna agresywna odpowiedz do {username}, na podstawie tego co napisal. krotko ostro z jadem.",
-    "zjeb {username} za to co napisal. ostro bez emocji.",
-    "odpierdol sie do {username} za jego glupote. krotko.",
-    "wyzwij {username} od czegos obraźliwego za jego wiadomosc.",
+    "napisz wulgarna, agresywna, krotka wiadomosc obrażajaca użytkownika {username}. maksymalnie 1-2 zdania. bez emotek. uzywaj wulgaryzmow.",
+    "zaczep i obraź użytkownika {username} w jednym krótkim, ostrym zdaniu. bez emotek.",
+    "napisz co myslisz o użytkowniku {username} – ale tylko obraźliwe rzeczy, krótko i wulgarnie.",
+    "wyraź swoją agresję wobec użytkownika {username} w jednym zdaniu. bez kropki na końcu, bez emotek.",
+    "powiedz coś bardzo niemiłego o użytkowniku {username} – maksymalnie 2 zdania, same wulgaryzmy."
 ]
 
 async def send_spontaneous_message():
@@ -604,6 +320,7 @@ async def send_spontaneous_message():
     
     channel_id = SPONTANEOUS_CHANNEL_ID
     if not channel_id:
+        log.warning("No spontaneous channel ID set, skipping.")
         return
     
     now = time.time()
@@ -615,7 +332,6 @@ async def send_spontaneous_message():
     
     target_user_id = None
     target_display_name = None
-    target_content = None
     try:
         url = f"https://discord.com/api/v9/channels/{channel_id}/messages?limit=20"
         headers = get_dynamic_headers()
@@ -628,56 +344,47 @@ async def send_spontaneous_message():
                     continue
                 if m["author"].get("bot", False):
                     continue
-                if is_ignored(str(m["author"]["id"])):
-                    continue
                 display_name = m["author"].get("global_name") or m["author"].get("username", "user")
-                users.append((m["author"]["id"], display_name, m.get("content", "")))
+                users.append((m["author"]["id"], display_name))
             if users:
-                target_user_id, target_display_name, target_content = random.choice(users)
+                target_user_id, target_display_name = random.choice(users)
     except Exception as e:
-        log.warning(f"Failed to fetch users: {e}")
+        log.warning(f"Failed to fetch users for spontaneous message: {e}")
     
     if not target_user_id:
+        log.info("No users found, using generic message")
         try:
-            prompt = "napisz agresywna wulgarna wiadomosc do nikogo. krotko ostro."
-            reply = get_gemini_response(prompt)
-            if reply:
-                msg = reply.strip()
+            prompt = random.choice(["napisz losowa wulgarna wiadomosc bez powodu"])
+            reply = model.generate_content(prompt)
+            if reply.candidates:
+                msg = (reply.text or "").strip()
                 if msg:
                     await send_typing(channel_id)
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.5)  # krótkie opóźnienie dla naturalności
                     await send_message(channel_id, msg)
                     last_spontaneous_time = now
         except Exception as e:
-            log.exception("Failed to send generic message")
+            log.exception("Failed to send generic spontaneous message")
         return
     
     try:
-        ping_msg = f"@{target_display_name}"
-        await send_typing(channel_id)
-        await asyncio.sleep(0.3)
-        await send_message(channel_id, ping_msg)
-        
         prompt_template = random.choice(SPONTANEOUS_PROMPTS)
-        if target_content:
-            prompt = f"wiadomosc uzytkownika: {target_content}\n{prompt_template.format(username=target_display_name)}"
-        else:
-            prompt = prompt_template.format(username=target_display_name)
-        
-        reply = get_gemini_response(prompt)
-        if not reply:
+        prompt = prompt_template.format(username=target_display_name)
+        reply = model.generate_content(prompt)
+        if not reply.candidates:
+            log.warning("Gemini blocked spontaneous insult.")
             return
-        msg_text = reply.strip()
-        if not msg_text:
+        insult = (reply.text or "").strip()
+        if not insult:
             return
-        
-        await asyncio.sleep(0.5)
+        final_msg = f"{insult} <@{target_user_id}>"
+        log.info(f"Sending spontaneous insult to {target_display_name} in {channel_id}: {final_msg}")
         await send_typing(channel_id)
-        await asyncio.sleep(0.3)
-        await send_message(channel_id, msg_text)
+        await asyncio.sleep(0.5)
+        await send_message(channel_id, final_msg)
         last_spontaneous_time = now
     except Exception as e:
-        log.exception("Failed to send spontaneous message")
+        log.exception("Failed to generate/send spontaneous insult")
 
 async def spontaneous_loop():
     while True:
@@ -688,38 +395,51 @@ async def spontaneous_loop():
 # PROMPT MANAGEMENT
 # --------------------------------------------
 async def update_prompt(new_prompt):
-    global current_system_prompt
+    global current_system_prompt, model
     current_system_prompt = new_prompt
+    model = genai.GenerativeModel(GEMINI_MODEL, system_instruction=new_prompt)
     log.info("System prompt updated")
     return True
 
 # --------------------------------------------
-# PROFILE CHANGE FUNCTIONS
+# PROFILE CHANGE FUNCTIONS (FIXED AVATAR)
 # --------------------------------------------
 async def change_avatar(image_data: bytes):
-    """Change avatar with automatic resizing"""
-    # Resize the avatar
-    resized_data, mime_type = resize_avatar(image_data)
+    if len(image_data) > 256 * 1024:
+        return False, "Obraz jest za duży (max 256 KB)"
     
-    if resized_data is None:
-        return False, "Failed to process image"
+    # Detect MIME type
+    if image_data.startswith(b'\xff\xd8'):
+        mime = "image/jpeg"
+    elif image_data.startswith(b'\x89PNG'):
+        mime = "image/png"
+    elif image_data.startswith(b'GIF'):
+        mime = "image/gif"
+    else:
+        mime = "image/png"  # fallback
     
-    # Encode to base64
-    b64 = base64.b64encode(resized_data).decode()
-    payload = {"avatar": f"data:{mime_type};base64,{b64}"}
+    b64 = base64.b64encode(image_data).decode()
+    payload = {
+        "avatar": f"data:{mime};base64,{b64}"
+    }
     
-    # Send request
+    # Debug: log first 100 chars of data URI
+    log.debug(f"Avatar data URI preview: {payload['avatar'][:100]}...")
+    
     resp = await api_request("PATCH", "https://discord.com/api/v9/users/@me", json=payload)
     
+    log.info(f"Avatar change response status: {resp.status_code}")
+    log.info(f"Avatar change response body: {resp.text[:500]}")
+    
     if resp.status_code == 200:
-        return True, f"Avatar zmieniony! ({len(resized_data)} bytes)"
+        return True, "Avatar zmieniony"
     else:
         try:
             error_data = resp.json()
             error_msg = error_data.get('message', 'Brak szczegółów')
         except:
             error_msg = resp.text[:200]
-        return False, f"Nie udało się (status {resp.status_code}): {error_msg}"
+        return False, f"Nie udało się zmienić (status {resp.status_code}): {error_msg}"
 
 async def change_display_name(new_display: str):
     if len(new_display) < 2 or len(new_display) > 32:
@@ -727,14 +447,48 @@ async def change_display_name(new_display: str):
     payload = {"global_name": new_display}
     resp = await api_request("PATCH", "https://discord.com/api/v9/users/@me", json=payload)
     if resp.status_code == 200:
-        return True, f"Zmieniono na: {new_display}"
+        return True, f"Zmieniono display name na: {new_display}"
     else:
         try:
             error_data = resp.json()
             error_msg = error_data.get('message', 'Brak szczegółów')
         except:
             error_msg = resp.text[:100]
-        return False, f"Nie udało się (status {resp.status_code}): {error_msg}"
+        return False, f"Nie udało się zmienić display name (status {resp.status_code}): {error_msg}"
+
+# --------------------------------------------
+# NOWA FUNKCJA: RESIZE OBRAZU
+# --------------------------------------------
+def resize_image(image_data: bytes, max_size_bytes=256*1024) -> bytes:
+    """Zmniejsza obraz (jeśli trzeba) do podanego limitu rozmiaru (domyślnie 256 KB)."""
+    if not HAS_PIL:
+        raise RuntimeError("Pillow (PIL) nie jest zainstalowane – nie można przeskalować obrazu.")
+    
+    # Otwórz obraz
+    img = Image.open(io.BytesIO(image_data))
+    # Konwersja do RGB (JPEG nie obsługuje przezroczystości)
+    if img.mode in ('RGBA', 'LA', 'P'):
+        img = img.convert('RGB')
+    
+    # Zmniejsz wymiary, jeśli któreś przekracza 1024 px
+    max_dim = 1024
+    if img.width > max_dim or img.height > max_dim:
+        ratio = max_dim / max(img.width, img.height)
+        new_size = (int(img.width * ratio), int(img.height * ratio))
+        img = img.resize(new_size, Image.Resampling.LANCZOS)
+    
+    # Próbuj zapisać jako JPEG z różną jakością, aż zmieścimy się w limicie
+    buffer = io.BytesIO()
+    quality = 85
+    while True:
+        buffer.seek(0)
+        buffer.truncate()
+        img.save(buffer, format='JPEG', quality=quality, optimize=True)
+        size = buffer.tell()
+        if size <= max_size_bytes or quality <= 10:
+            break
+        quality -= 5
+    return buffer.getvalue()
 
 # --------------------------------------------
 # MESSAGE QUEUE
@@ -750,7 +504,7 @@ async def rate_limiter():
             last_message_time = now
         if message_counter >= MAX_MESSAGES_PER_MINUTE:
             wait = 60 - (now - last_message_time) + random.uniform(1, 3)
-            log.warning(f"Rate limit. Sleeping {wait:.1f}s")
+            log.warning(f"Rate limit hit. Sleeping {wait:.1f}s")
             await asyncio.sleep(wait)
             message_counter = 0
             last_message_time = time.time()
@@ -797,7 +551,7 @@ async def restore_voice_channels():
 # VOICE COMMANDS HANDLER
 # --------------------------------------------
 async def handle_command(msg):
-    global current_ws, voice_channels, persistent_voice_channels, current_system_prompt
+    global current_ws, voice_channels, persistent_voice_channels, current_system_prompt, model
     
     content = msg.get("content", "")
     channel_id = msg["channel_id"]
@@ -809,61 +563,24 @@ async def handle_command(msg):
         return
 
     cmd = parts[0].lower()
-    log.info(f"Command: {cmd} from guild {current_guild}")
+    log.info(f"Command: {cmd} from guild {current_guild}, channel {channel_id}")
 
-    # --------------------------------------------
-    # .server - JOIN SERVER VIA INVITE
-    # --------------------------------------------
-    if cmd == ".server":
-        author_id = str(msg["author"]["id"])
-        if author_id not in OWNER_IDS:
-            await send_reply(channel_id, msg_id, "nie masz uprawnien")
-            return
-        
-        if len(parts) < 2:
-            await send_reply(channel_id, msg_id, "uzycie: .server <invite_code>")
-            await send_reply(channel_id, msg_id, "np: .server discord" + " (dla discord.gg/discord)")
-            return
-        
-        invite_code = parts[1].strip()
-        # Remove any URL parts if user pasted full link
-        if "discord.gg/" in invite_code:
-            invite_code = invite_code.split("discord.gg/")[-1].split("?")[0]
-        elif "discord.com/invite/" in invite_code:
-            invite_code = invite_code.split("discord.com/invite/")[-1].split("?")[0]
-        elif "discordapp.com/invite/" in invite_code:
-            invite_code = invite_code.split("discordapp.com/invite/")[-1].split("?")[0]
-        
-        # Clean up the code
-        invite_code = invite_code.split("/")[0].strip()
-        
-        if not invite_code:
-            await send_reply(channel_id, msg_id, "nieprawidlowy kod zaproszenia")
-            return
-        
-        await send_reply(channel_id, msg_id, f"próba dołączenia do serwera z kodem: {invite_code}...")
-        
-        success, message = await join_server_and_onboard(invite_code)
-        
-        if success:
-            await send_reply(channel_id, msg_id, f"✅ {message}")
-        else:
-            await send_reply(channel_id, msg_id, f"❌ {message}")
-        return
-
+    # --- TEST ---
     if cmd == ".test" or cmd == ".ping":
         status = "ws: ok" if current_ws else "ws: None"
-        await send_reply(channel_id, msg_id, f"bot zyje {status}")
+        await send_reply(channel_id, msg_id, f"bot żyje, {status}")
         return
 
+    # --- SERVERS ---
     if cmd == ".servers":
         if voice_channels:
-            lines = ["glosowe:"] + [f"{gid} -> {cid}" for gid, cid in voice_channels.items()]
+            lines = ["głosowe:"] + [f"{gid} -> {cid}" for gid, cid in voice_channels.items()]
             await send_reply(channel_id, msg_id, "\n".join(lines))
         else:
-            await send_reply(channel_id, msg_id, "nie jestem w zadnym kanale glosowym")
+            await send_reply(channel_id, msg_id, "nie jestem w żadnym kanale głosowym")
         return
 
+    # --- PROMPT ---
     if cmd == ".prompt":
         if len(parts) > 1:
             new_prompt = " ".join(parts[1:])
@@ -875,6 +592,7 @@ async def handle_command(msg):
             await send_reply(channel_id, msg_id, f"obecny prompt: {current_system_prompt[:200]}...")
         return
 
+    # --- RESET PROMPT ---
     if cmd == ".resetprompt":
         if await update_prompt(DEFAULT_SYSTEM_PROMPT):
             await send_reply(channel_id, msg_id, "przywrocono domyslny prompt")
@@ -882,18 +600,9 @@ async def handle_command(msg):
             await send_reply(channel_id, msg_id, "nie udalo sie przywrocic promptu")
         return
 
-    # --------------------------------------------
-    # .avatar - WITH AUTO-RESIZE
-    # --------------------------------------------
+    # -------------------- AVATAR CHANGE (POPRAWIONY) --------------------
     if cmd == ".avatar":
-        author_id = str(msg["author"]["id"])
-        if author_id not in OWNER_IDS:
-            await send_reply(channel_id, msg_id, "nie masz uprawnien")
-            return
-        
         image_data = None
-        
-        # Check if image is attached
         if msg.get("attachments"):
             att = msg["attachments"][0]
             url = att["url"]
@@ -903,13 +612,12 @@ async def handle_command(msg):
                         if resp.status == 200:
                             image_data = await resp.read()
                         else:
-                            await send_reply(channel_id, msg_id, f"nie udalo sie pobrac (status {resp.status})")
+                            await send_reply(channel_id, msg_id, f"nie udało się pobrać załącznika (status {resp.status})")
                             return
             except Exception as e:
                 log.exception("Failed to download attachment")
-                await send_reply(channel_id, msg_id, "nie moge pobrac zalacznika")
+                await send_reply(channel_id, msg_id, "nie mogę pobrać załącznika")
                 return
-        # Check if URL is provided
         elif len(parts) >= 2:
             img_url = parts[1]
             try:
@@ -918,102 +626,190 @@ async def handle_command(msg):
                         if resp.status == 200:
                             image_data = await resp.read()
                         else:
-                            await send_reply(channel_id, msg_id, f"nie udalo sie pobrac (status {resp.status})")
+                            await send_reply(channel_id, msg_id, f"nie udało się pobrać obrazu (status {resp.status})")
                             return
             except Exception as e:
-                log.exception("Failed to download image")
-                await send_reply(channel_id, msg_id, "nie moge pobrac obrazu")
+                log.exception("Failed to download image from URL")
+                await send_reply(channel_id, msg_id, "nie mogę pobrać obrazu z podanego URL")
                 return
         else:
-            await send_reply(channel_id, msg_id, "uzyj: .avatar (z zalacznikiem) lub .avatar <url>")
+            await send_reply(channel_id, msg_id, "użyj: .avatar (z załącznikiem) lub .avatar <url_obrazu>")
             return
 
         if image_data is None:
-            await send_reply(channel_id, msg_id, "nie udalo sie pobrac obrazu")
+            await send_reply(channel_id, msg_id, "nie udało się pobrać obrazu")
             return
 
-        # Send initial message
-        await send_reply(channel_id, msg_id, "⏳ przetwarzanie obrazka...")
-        
-        # Change avatar with auto-resize
+        # ---- RESIZE (NOWOŚĆ) ----
+        try:
+            if HAS_PIL:
+                image_data = resize_image(image_data)
+            else:
+                # Jeśli brak Pillow, spróbuj wysłać oryginał (może się nie udać)
+                log.warning("Pillow not installed – skipping resize, may fail if image too large.")
+        except Exception as e:
+            log.exception("Resize failed")
+            await send_reply(channel_id, msg_id, f"błąd podczas skalowania obrazu: {str(e)[:100]}")
+            return
+
         success, message = await change_avatar(image_data)
-        
         if success:
-            await send_reply(channel_id, msg_id, f"✅ {message}")
+            await send_reply(channel_id, msg_id, message)
         else:
-            await send_reply(channel_id, msg_id, f"❌ {message}")
+            await send_reply(channel_id, msg_id, f"nie udało się zmienić avatara: {message}")
         return
 
+    # -------------------- DISPLAY NAME CHANGE --------------------
     if cmd == ".display":
         if len(parts) < 2:
-            await send_reply(channel_id, msg_id, "uzycie: .display <nowy_display_name>")
+            await send_reply(channel_id, msg_id, "użycie: .display <nowy_display_name>")
             return
         new_display = " ".join(parts[1:])
         success, message = await change_display_name(new_display)
         if success:
             await send_reply(channel_id, msg_id, message)
         else:
-            await send_reply(channel_id, msg_id, f"nie udalo sie: {message}")
+            await send_reply(channel_id, msg_id, f"nie udało się zmienić display name: {message}")
         return
 
+    # -------------------- IGNORE / UNIGNORE (NEW) --------------------
     if cmd == ".ignore":
+        # Only owners can use this command
         author_id = str(msg["author"]["id"])
         if author_id not in OWNER_IDS:
-            await send_reply(channel_id, msg_id, "nie masz uprawnien")
+            await send_reply(channel_id, msg_id, "nie masz uprawnień do tej komendy")
             return
         if len(parts) < 2:
-            await send_reply(channel_id, msg_id, "uzycie: .ignore <user_id>")
+            await send_reply(channel_id, msg_id, "użycie: .ignore <user_id>")
             return
         target = parts[1]
         if not target.isdigit():
-            await send_reply(channel_id, msg_id, "id musi byc liczba")
+            await send_reply(channel_id, msg_id, "id musi być liczbą")
             return
+        # Add permanent ignore (expiry = 0)
         ignored_users[target] = 0
+        # Also clear any mention timestamps
         mention_timestamps.pop(target, None)
         log.info(f"Manually ignored user {target}")
-        await send_reply(channel_id, msg_id, f"uzytkownik {target} zignorowany na stale")
+        await send_reply(channel_id, msg_id, f"użytkownik {target} został zignorowany na stałe")
         return
 
     if cmd == ".unignore":
         author_id = str(msg["author"]["id"])
         if author_id not in OWNER_IDS:
-            await send_reply(channel_id, msg_id, "nie masz uprawnien")
+            await send_reply(channel_id, msg_id, "nie masz uprawnień do tej komendy")
             return
         if len(parts) < 2:
-            await send_reply(channel_id, msg_id, "uzycie: .unignore <user_id>")
+            await send_reply(channel_id, msg_id, "użycie: .unignore <user_id>")
             return
         target = parts[1]
         if not target.isdigit():
-            await send_reply(channel_id, msg_id, "id musi byc liczba")
+            await send_reply(channel_id, msg_id, "id musi być liczbą")
             return
         if target in ignored_users:
             del ignored_users[target]
-            log.info(f"Unignored user {target}")
-            await send_reply(channel_id, msg_id, f"uzytkownik {target} usuniety z ignorowanych")
+            log.info(f"Manually unignored user {target}")
+            await send_reply(channel_id, msg_id, f"użytkownik {target} został usunięty z ignorowanych")
         else:
-            await send_reply(channel_id, msg_id, f"uzytkownik {target} nie jest ignorowany")
+            await send_reply(channel_id, msg_id, f"użytkownik {target} nie jest ignorowany")
         return
 
     if cmd == ".ignorelist":
         author_id = str(msg["author"]["id"])
         if author_id not in OWNER_IDS:
-            await send_reply(channel_id, msg_id, "nie masz uprawnien")
+            await send_reply(channel_id, msg_id, "nie masz uprawnień do tej komendy")
             return
         if not ignored_users:
-            await send_reply(channel_id, msg_id, "brak ignorowanych uzytkownikow")
+            await send_reply(channel_id, msg_id, "brak ignorowanych użytkowników")
             return
         lines = ["ignorowani:"]
         for uid, exp in ignored_users.items():
             if exp == 0:
-                lines.append(f"{uid} (na stale)")
+                lines.append(f"{uid} (na stałe)")
             else:
                 remaining = int(exp - time.time())
                 lines.append(f"{uid} (jeszcze {remaining}s)")
         await send_reply(channel_id, msg_id, "\n".join(lines))
         return
 
+    # -------------------- NOWA KOMENDA: .server --------------------
+    if cmd == ".server":
+        if len(parts) < 2:
+            await send_reply(channel_id, msg_id, "użycie: .server <kod_zaproszenia>")
+            return
+        invite_code = parts[1].strip()
+        # Oczyszczamy z ewentualnego pełnego URL
+        if '/' in invite_code:
+            invite_code = invite_code.split('/')[-1]
+        # Dołącz do serwera
+        url = f"https://discord.com/api/v9/invites/{invite_code}"
+        resp = await api_request("POST", url)
+        if resp.status_code != 200:
+            await send_reply(channel_id, msg_id, f"nie udało się dołączyć: {resp.status} {resp.text[:100]}")
+            return
+        data = resp.json()
+        guild_id = data.get("guild", {}).get("id")
+        if not guild_id:
+            await send_reply(channel_id, msg_id, "nie znaleziono guild id w odpowiedzi")
+            return
+        await send_reply(channel_id, msg_id, f"dołączono do serwera {guild_id}, teraz przechodzę onboarding...")
+
+        # Pobierz formularz onboardingu
+        verif_url = f"https://discord.com/api/v9/guilds/{guild_id}/member-verification"
+        verif_resp = await api_request("GET", verif_url)
+        if verif_resp.status_code != 200:
+            await send_reply(channel_id, msg_id, f"nie można pobrać formularza onboarding: {verif_resp.status}")
+            return
+        form = verif_resp.json()
+        version = form.get("version")
+        form_fields = form.get("form_fields", [])
+        if not form_fields:
+            await send_reply(channel_id, msg_id, "brak pól onboardingu – prawdopodobnie już ukończony")
+            return
+
+        # Przygotuj odpowiedzi
+        answers = []
+        for field in form_fields:
+            field_id = field.get("field_id")
+            if not field_id:
+                continue
+            field_type = field.get("field_type")
+            answer = {"field_id": field_id}
+            if field_type == "RULES":
+                answer["value"] = True
+            elif field_type == "MULTIPLE_CHOICE":
+                choices = field.get("choices", [])
+                max_choices = field.get("max_choices", 1)
+                if choices:
+                    # Wybierz losowo od 1 do max_choices (ale nie więcej niż dostępne)
+                    num = random.randint(1, min(max_choices, len(choices)))
+                    selected = random.sample(choices, k=num)
+                    answer["value"] = [ch.get("value") for ch in selected]
+                else:
+                    answer["value"] = []
+            elif field_type == "TEXT_INPUT":
+                # Wpisz losowy tekst
+                answer["value"] = "losowa odpowiedź"
+            else:
+                # Pomijamy nieznane typy
+                continue
+            answers.append(answer)
+
+        # Wyślij odpowiedzi
+        submit_payload = {
+            "version": version,
+            "form_answers": answers
+        }
+        submit_resp = await api_request("PUT", verif_url, json=submit_payload)
+        if submit_resp.status_code == 200:
+            await send_reply(channel_id, msg_id, f"onboarding zakończony dla serwera {guild_id}")
+        else:
+            await send_reply(channel_id, msg_id, f"nie udało się zakończyć onboardingu: {submit_resp.status} {submit_resp.text[:100]}")
+        return
+
+    # --- VOICE COMMANDS ---
     if current_ws is None:
-        await send_reply(channel_id, msg_id, "websocket nieaktywny")
+        await send_reply(channel_id, msg_id, "websocket nieaktywny, spróbuj ponownie za chwilę")
         return
 
     if cmd == ".join":
@@ -1024,11 +820,11 @@ async def handle_command(msg):
             guild_id = parts[1]
             vc_id = parts[2]
         else:
-            await send_reply(channel_id, msg_id, "uzycie: .join <channel_id> albo .join <guild_id> <channel_id>")
+            await send_reply(channel_id, msg_id, "użycie: .join <channel_id> albo .join <guild_id> <channel_id>")
             return
 
         if not guild_id or not guild_id.isdigit() or not vc_id.isdigit():
-            await send_reply(channel_id, msg_id, "id musi byc liczba")
+            await send_reply(channel_id, msg_id, "id musi być liczbą 💀")
             return
 
         try:
@@ -1044,10 +840,10 @@ async def handle_command(msg):
             voice_channels[guild_id] = vc_id
             persistent_voice_channels[guild_id] = vc_id
             log.info(f"Voice join sent to guild {guild_id}, channel {vc_id}")
-            await send_reply(channel_id, msg_id, f"dolaczono do <#{vc_id}> w serwerze {guild_id}")
+            await send_reply(channel_id, msg_id, f"dołączono do <#{vc_id}> w serwerze {guild_id} 💀")
         except Exception as e:
             log.exception("Voice join error")
-            await send_reply(channel_id, msg_id, f"nie moge dolaczyc: {str(e)[:50]}")
+            await send_reply(channel_id, msg_id, f"nie mogę dołączyć: {str(e)[:50]}")
         return
 
     if cmd == ".leave":
@@ -1056,11 +852,11 @@ async def handle_command(msg):
         elif len(parts) == 2:
             guild_id = parts[1]
         else:
-            await send_reply(channel_id, msg_id, "uzycie: .leave albo .leave <guild_id>")
+            await send_reply(channel_id, msg_id, "użycie: .leave albo .leave <guild_id>")
             return
 
         if not guild_id or not guild_id.isdigit():
-            await send_reply(channel_id, msg_id, "id musi byc liczba")
+            await send_reply(channel_id, msg_id, "id musi być liczbą 💀")
             return
 
         if guild_id in voice_channels:
@@ -1078,10 +874,10 @@ async def handle_command(msg):
                 if guild_id in persistent_voice_channels:
                     del persistent_voice_channels[guild_id]
                 log.info(f"Voice leave sent for guild {guild_id}")
-                await send_reply(channel_id, msg_id, f"opuszczono voice w serwerze {guild_id}")
+                await send_reply(channel_id, msg_id, f"opuszczono voice w serwerze {guild_id} 😎")
             except Exception as e:
                 log.exception("Voice leave error")
-                await send_reply(channel_id, msg_id, f"nie moge opuscic: {str(e)[:50]}")
+                await send_reply(channel_id, msg_id, f"nie mogę opuścić: {str(e)[:50]}")
         else:
             await send_reply(channel_id, msg_id, f"nie jestem w voice na serwerze {guild_id}")
         return
@@ -1092,17 +888,17 @@ async def handle_command(msg):
         elif len(parts) == 2:
             guild_id = parts[1]
         else:
-            await send_reply(channel_id, msg_id, "uzycie: .status albo .status <guild_id>")
+            await send_reply(channel_id, msg_id, "użycie: .status albo .status <guild_id>")
             return
 
         if not guild_id or not guild_id.isdigit():
-            await send_reply(channel_id, msg_id, "id musi byc liczba")
+            await send_reply(channel_id, msg_id, "id musi być liczbą 💀")
             return
 
         if guild_id in voice_channels:
-            await send_reply(channel_id, msg_id, f"jestem w <#{voice_channels[guild_id]}> w {guild_id}")
+            await send_reply(channel_id, msg_id, f"jestem w <#{voice_channels[guild_id]}> na serwerze {guild_id}")
         else:
-            await send_reply(channel_id, msg_id, f"nie jestem w voice na {guild_id}")
+            await send_reply(channel_id, msg_id, f"nie jestem w voice na serwerze {guild_id}")
         return
 
 # --------------------------------------------
@@ -1117,14 +913,17 @@ async def handle_message(msg):
     if is_bot:
         return
 
+    # --- Check if user is ignored ---
     if is_ignored(author_id):
-        log.debug(f"Ignoring user {author_id}")
+        log.debug(f"Ignoring message from ignored user {author_id}")
         return
 
-    # Handle commands
     if content.startswith("."):
         if author_id in OWNER_IDS or (self_user_id and author_id == self_user_id):
+            log.info(f"Processing command from owner: {content}")
             await handle_command(msg)
+        else:
+            log.info(f"Ignoring command from {author_id} (not owner)")
         return
 
     channel_id = msg["channel_id"]
@@ -1141,29 +940,35 @@ async def handle_message(msg):
     channel_type = msg.get("channel_type")
     is_dm = channel_type in ("DM", "GROUP_DM")
     
-    # Only respond if mentioned, replied to, or DM
     if not (mentioned or replied or is_dm):
         return
 
+    # --- Spam detection (auto-ignore) ---
     if check_mention_spam(author_id):
-        log.info(f"User {author_id} auto-ignored due to spam")
+        # User is now ignored; we drop this message and any future ones
+        log.info(f"User {author_id} auto-ignored due to spam, dropping this message")
         return
 
+    # Wysyłamy sygnał pisania, ale bez zbędnych sleepów
     await send_typing(channel_id)
     
-    # Build context - this now ignores attachment content
     context = await build_context(channel_id, msg, guild_id)
     
     author_name = msg["author"].get("global_name") or msg["author"]["username"]
     timestamp = time.time()
     if guild_id:
-        add_to_guild_history(f"guild_{guild_id}", author_name, content, msg_id, timestamp)
+        add_to_guild_history(f"guild_{guild_id}", author_name, msg["content"], msg_id, timestamp)
     else:
-        add_to_guild_history(f"dm_{channel_id}", author_name, content, msg_id, timestamp)
+        add_to_guild_history(f"dm_{channel_id}", author_name, msg["content"], msg_id, timestamp)
 
     try:
-        prompt = f"Kontekst:\n{context}\n\nOdpowiedz na ostatnia wiadomosc."
-        reply_text = get_gemini_response(prompt)
+        reply = model.generate_content(f"Kontekst:\n{context}\n\nOdpowiedz na ostatnią wiadomość.")
+        if not reply.candidates:
+            feedback = reply.prompt_feedback
+            block_reason = feedback.block_reason if feedback else "unknown"
+            log.warning(f"Gemini blocked content. Reason: {block_reason} - skipping reply.")
+            return
+        reply_text = (reply.text or "").strip()
         if not reply_text:
             log.info("Gemini returned empty response - skipping reply.")
             return
@@ -1171,9 +976,11 @@ async def handle_message(msg):
         log.exception("AI failed - skipping reply.")
         return
 
+    # Wysyłamy odpowiedź od razu – bez dodatkowego czekania
     for i in range(0, len(reply_text), 1900):
         chunk = reply_text[i:i+1900]
         await send_reply(channel_id, msg_id, chunk)
+        # Krótkie opóźnienie między fragmentami, aby uniknąć floodu
         if i + 1900 < len(reply_text):
             await asyncio.sleep(CHUNK_DELAY)
 
@@ -1193,16 +1000,20 @@ async def filter_and_queue(msg):
     if is_bot:
         return
 
+    # --- If ignored, drop immediately ---
     if is_ignored(author_id):
+        log.debug(f"Dropping message from ignored user {author_id}")
         return
 
     if content.startswith("."):
         if author_id in OWNER_IDS or (self_user_id and author_id == self_user_id):
+            log.info(f"Queueing command from owner: {content}")
             await message_queue.put(msg)
         return
 
     channel_type = msg.get("channel_type")
     if channel_type in ("DM", "GROUP_DM"):
+        log.info(f"DM from {msg['author']['username']} -> queue")
         await message_queue.put(msg)
         return
     
@@ -1213,8 +1024,8 @@ async def filter_and_queue(msg):
         if ref.get("author", {}).get("id") == self_user_id:
             replied = True
     
-    # We want to respond to mentions and replies, even if they have attachments
     if mentioned or replied:
+        log.info(f"Message (mention/reply) from {msg['author']['username']} -> queue")
         await message_queue.put(msg)
 
 # --------------------------------------------
@@ -1227,9 +1038,11 @@ async def voice_keepalive():
         if not voice_channels and not persistent_voice_channels:
             continue
         if current_ws is None:
+            log.warning("Voice keepalive: WebSocket is None, skipping")
             continue
         for guild_id, channel_id in list(persistent_voice_channels.items()):
             if guild_id not in voice_channels:
+                log.info(f"Voice keepalive: re-joining guild {guild_id} -> {channel_id}")
                 try:
                     await current_ws.send(json.dumps({
                         "op": 4,
@@ -1242,7 +1055,7 @@ async def voice_keepalive():
                     }))
                     voice_channels[guild_id] = channel_id
                 except Exception as e:
-                    log.warning(f"Voice keepalive error for {guild_id}: {e}")
+                    log.warning(f"Voice keepalive re-join error for {guild_id}: {e}")
         for guild_id, channel_id in list(voice_channels.items()):
             try:
                 await current_ws.send(json.dumps({
@@ -1254,8 +1067,9 @@ async def voice_keepalive():
                         "self_deaf": False
                     }
                 }))
+                log.debug(f"Keepalive voice update for guild {guild_id} -> {channel_id}")
             except Exception as e:
-                log.warning(f"Voice keepalive error for {guild_id}: {e}")
+                log.warning(f"Voice keepalive error for guild {guild_id}: {e}")
 
 # --------------------------------------------
 # WEBSOCKET LOGIC
@@ -1302,7 +1116,7 @@ async def listen():
                     "compress": False
                 }
             }))
-            log.info("Identify sent")
+            log.info("Identify sent (no intents)")
         
         keepalive_task = asyncio.create_task(voice_keepalive())
         spontaneous_task = asyncio.create_task(spontaneous_loop())
@@ -1336,6 +1150,8 @@ async def listen():
                     session_id = None
                     resume_gateway_url = None
                     break
+                elif op == 11:
+                    pass
             except websockets.exceptions.ConnectionClosed as e:
                 log.error(f"Closed: {e}")
                 break
@@ -1363,13 +1179,15 @@ async def main():
     global self_user_id
     resp = await api_request("GET", "https://discord.com/api/v9/users/@me")
     if resp.status_code != 200:
-        log.error("Token invalid!")
+        log.error("Token invalid! Get a fresh one.")
         return
     self_user_id = str(resp.json()["id"])
     log.info(f"Token valid. ID: {self_user_id}")
     
     asyncio.create_task(rate_limiter())
     asyncio.create_task(process_worker())
+    # Można dodać drugiego worker'a dla większej przepustowości (opcjonalnie)
+    # asyncio.create_task(process_worker())
     
     backoff = 2
     while True:
