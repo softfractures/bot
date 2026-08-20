@@ -23,7 +23,7 @@ load_dotenv()
 # --------------------------------------------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")  # Changed to 3.6 flash
 
 # Multiple owners
 OWNER_IDS = [
@@ -45,10 +45,10 @@ MAX_MESSAGES_PER_MINUTE = 10
 HISTORY_CACHE_TTL = 60
 MAX_HISTORY_PER_GUILD = 50
 
-# Image compression settings
-MAX_IMAGE_SIZE = 1024 * 1024  # 1MB max after compression
-IMAGE_QUALITY = 85  # JPEG quality (1-100)
-MAX_IMAGE_DIMENSION = 1024  # Max width/height
+# Aggressive image compression for speed
+MAX_IMAGE_SIZE = 300 * 1024  # 300KB max - smaller for speed
+IMAGE_QUALITY = 60  # Lower quality = faster processing
+MAX_IMAGE_DIMENSION = 768  # Smaller dimension = faster
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("stealth-selfbot")
@@ -103,8 +103,8 @@ DEFAULT_SYSTEM_PROMPT = (
 
 current_system_prompt = DEFAULT_SYSTEM_PROMPT
 
-def compress_image(image_bytes, max_size=MAX_IMAGE_SIZE, max_dimension=MAX_IMAGE_DIMENSION, quality=IMAGE_QUALITY):
-    """Compress image to reduce size while maintaining quality"""
+def fast_compress_image(image_bytes, max_size=MAX_IMAGE_SIZE, max_dimension=MAX_IMAGE_DIMENSION, quality=IMAGE_QUALITY):
+    """Fast image compression for Gemini - aggressive but fast"""
     try:
         # Open image
         img = Image.open(io.BytesIO(image_bytes))
@@ -113,45 +113,42 @@ def compress_image(image_bytes, max_size=MAX_IMAGE_SIZE, max_dimension=MAX_IMAGE
         if img.mode in ('RGBA', 'LA', 'P'):
             img = img.convert('RGB')
         
-        # Resize if too large
+        # Quick resize if too large
         width, height = img.size
         if width > max_dimension or height > max_dimension:
             ratio = min(max_dimension / width, max_dimension / height)
             new_width = int(width * ratio)
             new_height = int(height * ratio)
             img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-            log.info(f"Resized image from {width}x{height} to {new_width}x{new_height}")
         
-        # Compress by saving as JPEG with quality
+        # Compress to JPEG with low quality for speed
         output = io.BytesIO()
         img.save(output, format='JPEG', quality=quality, optimize=True)
         compressed = output.getvalue()
         
-        # If still too large, reduce quality further
+        # If still too large, aggressively reduce
         if len(compressed) > max_size:
-            log.info(f"Image still too large ({len(compressed)} bytes), reducing quality")
-            for q in range(quality - 10, 40, -5):
+            for q in range(quality - 10, 20, -5):
                 output = io.BytesIO()
                 img.save(output, format='JPEG', quality=q, optimize=True)
                 compressed = output.getvalue()
                 if len(compressed) <= max_size:
-                    log.info(f"Compressed to {len(compressed)} bytes with quality {q}")
                     break
         
-        log.info(f"Compressed image from {len(image_bytes)} to {len(compressed)} bytes")
+        log.info(f"Fast compressed: {len(image_bytes)} → {len(compressed)} bytes")
         return compressed
         
     except Exception as e:
-        log.warning(f"Image compression failed: {e}, using original")
+        log.warning(f"Fast compression failed: {e}, using original")
         return image_bytes
 
 def get_gemini_response(prompt, image=None):
-    """Get response from Gemini using the new API"""
+    """Get response from Gemini - fast with compressed images"""
     try:
         system_message = f"{current_system_prompt}\n\n{prompt}"
         
         if image:
-            # If image is a PIL Image, convert to bytes
+            # Fast compress the image
             if isinstance(image, Image.Image):
                 img_byte_arr = io.BytesIO()
                 image.save(img_byte_arr, format='PNG')
@@ -159,18 +156,18 @@ def get_gemini_response(prompt, image=None):
             else:
                 image_bytes = image
             
-            # Compress the image
-            image_bytes = compress_image(image_bytes)
+            # Compress aggressively
+            image_bytes = fast_compress_image(image_bytes)
             
             # Upload the compressed image
             uploaded_file = client.files.upload(
                 file=io.BytesIO(image_bytes),
                 config=types.UploadFileConfig(
-                    mime_type="image/jpeg"  # Using JPEG after compression
+                    mime_type="image/jpeg"
                 )
             )
             
-            # Generate response with image
+            # Generate response with image - short timeout
             response = client.models.generate_content(
                 model=GEMINI_MODEL,
                 contents=[
@@ -181,13 +178,25 @@ def get_gemini_response(prompt, image=None):
                             types.Part(file_data=types.FileData(file_uri=uploaded_file.uri))
                         ]
                     )
-                ]
+                ],
+                config=types.GenerateContentConfig(
+                    temperature=0.9,
+                    max_output_tokens=150,  # Short responses
+                    top_p=0.95,
+                    top_k=40,
+                )
             )
         else:
-            # Text only
+            # Text only - fast
             response = client.models.generate_content(
                 model=GEMINI_MODEL,
-                contents=system_message
+                contents=system_message,
+                config=types.GenerateContentConfig(
+                    temperature=0.9,
+                    max_output_tokens=150,
+                    top_p=0.95,
+                    top_k=40,
+                )
             )
         
         return response.text if response.text else None
@@ -331,15 +340,15 @@ async def download_image(url):
         log.warning(f"Failed to download image: {e}")
     return None
 
-def prepare_image_for_gemini(image_data):
-    """Prepare image for Gemini API - compress and convert to JPEG"""
+def fast_prepare_image(image_data):
+    """Fast prepare image - aggressive compression"""
     try:
         with Image.open(io.BytesIO(image_data)) as img:
             # Convert to RGB if needed
             if img.mode in ('RGBA', 'LA', 'P'):
                 img = img.convert('RGB')
             
-            # Resize if too large
+            # Aggressively resize
             width, height = img.size
             max_dim = MAX_IMAGE_DIMENSION
             if width > max_dim or height > max_dim:
@@ -347,24 +356,22 @@ def prepare_image_for_gemini(image_data):
                 new_width = int(width * ratio)
                 new_height = int(height * ratio)
                 img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-                log.info(f"Resized image from {width}x{height} to {new_width}x{new_height}")
             
-            # Compress to JPEG
+            # Compress to JPEG with low quality
             output = io.BytesIO()
             img.save(output, format='JPEG', quality=IMAGE_QUALITY, optimize=True)
             compressed = output.getvalue()
             
             # If still too large, reduce quality
             if len(compressed) > MAX_IMAGE_SIZE:
-                for q in range(IMAGE_QUALITY - 10, 40, -5):
+                for q in range(IMAGE_QUALITY - 10, 20, -5):
                     output = io.BytesIO()
                     img.save(output, format='JPEG', quality=q, optimize=True)
                     compressed = output.getvalue()
                     if len(compressed) <= MAX_IMAGE_SIZE:
-                        log.info(f"Compressed to {len(compressed)} bytes with quality {q}")
                         break
             
-            log.info(f"Prepared image: {len(compressed)} bytes (original: {len(image_data)})")
+            log.info(f"Fast prepared: {len(image_data)} → {len(compressed)} bytes")
             return compressed, "image/jpeg"
     except Exception as e:
         log.warning(f"Error preparing image: {e}")
@@ -471,7 +478,7 @@ async def build_context(channel_id, current_msg, guild_id=None):
     has_image = False
     image_data = None
     
-    # Check attachments in the current message - only PNG, JPG, JPEG, WEBP
+    # Check attachments - only PNG, JPG, JPEG, WEBP
     if current_msg.get("attachments"):
         for att in current_msg["attachments"]:
             content_type = att.get("content_type", "")
@@ -483,19 +490,17 @@ async def build_context(channel_id, current_msg, guild_id=None):
                 continue
             
             if content_type.startswith("image/"):
-                log.info(f"Found image attachment: {filename} with type {content_type}")
+                log.info(f"Found image: {filename} ({content_type})")
                 image_data = await download_image(att["url"])
                 if image_data:
-                    log.info(f"Downloaded image: {len(image_data)} bytes")
                     if is_supported_image_format(image_data):
                         has_image = True
-                        log.info(f"✓ Supported image detected: {filename}")
+                        log.info(f"✓ Supported: {filename} ({len(image_data)} bytes)")
                         break
                     else:
-                        log.info(f"✗ Unsupported image format: {filename}")
                         image_data = None
                 else:
-                    log.warning(f"Failed to download image: {filename}")
+                    log.warning(f"Failed to download: {filename}")
     
     for m in reversed(channel_msgs):
         author = m["author"].get("global_name") or m["author"]["username"]
@@ -503,7 +508,7 @@ async def build_context(channel_id, current_msg, guild_id=None):
         if m.get("attachments"):
             for att in m["attachments"]:
                 if att.get("content_type", "").startswith("image/"):
-                    msg_content += " [image attached]"
+                    msg_content += " [image]"
                     break
         lines.append(f"{author}: {msg_content}")
     
@@ -512,27 +517,20 @@ async def build_context(channel_id, current_msg, guild_id=None):
         guild_history = get_guild_history(guild_key, limit=10)
         for entry in guild_history:
             if entry["id"] != current_msg["id"]:
-                lines.append(f"[Guild memory] {entry['author']}: {entry['content']}")
+                lines.append(f"[Memory] {entry['author']}: {entry['content']}")
     
     if current_msg.get("referenced_message"):
         ref = current_msg["referenced_message"]
         if ref.get("content"):
             author = ref["author"].get("global_name") or ref["author"]["username"]
             lines.append(f"[Reply to] {author}: {ref['content']}")
-        if ref.get("attachments"):
-            for att in ref["attachments"]:
-                if att.get("content_type", "").startswith("image/"):
-                    lines.append("[Reply to image]")
-                    break
     
     author = current_msg["author"].get("global_name") or current_msg["author"]["username"]
     lines.append(f"{author}: {current_msg['content']}")
     
     if has_image and image_data:
-        log.info("Returning context with image")
         return "\n".join(lines), image_data
     
-    log.info("Returning context without image")
     return "\n".join(lines), None
 
 # --------------------------------------------
@@ -550,7 +548,6 @@ async def send_spontaneous_message():
     
     channel_id = SPONTANEOUS_CHANNEL_ID
     if not channel_id:
-        log.warning("No spontaneous channel ID set, skipping.")
         return
     
     now = time.time()
@@ -582,10 +579,9 @@ async def send_spontaneous_message():
             if users:
                 target_user_id, target_display_name, target_content = random.choice(users)
     except Exception as e:
-        log.warning(f"Failed to fetch users for spontaneous message: {e}")
+        log.warning(f"Failed to fetch users: {e}")
     
     if not target_user_id:
-        log.info("No users found, using generic message")
         try:
             prompt = "napisz agresywna wulgarna wiadomosc do nikogo. krotko ostro."
             reply = get_gemini_response(prompt)
@@ -597,7 +593,7 @@ async def send_spontaneous_message():
                     await send_message(channel_id, msg)
                     last_spontaneous_time = now
         except Exception as e:
-            log.exception("Failed to send generic spontaneous message")
+            log.exception("Failed to send generic message")
         return
     
     try:
@@ -605,7 +601,6 @@ async def send_spontaneous_message():
         await send_typing(channel_id)
         await asyncio.sleep(0.3)
         await send_message(channel_id, ping_msg)
-        log.info(f"Sent ping to {target_display_name} in {channel_id}")
         
         prompt_template = random.choice(SPONTANEOUS_PROMPTS)
         if target_content:
@@ -615,21 +610,18 @@ async def send_spontaneous_message():
         
         reply = get_gemini_response(prompt)
         if not reply:
-            log.warning("Gemini blocked spontaneous message.")
             return
         msg_text = reply.strip()
         if not msg_text:
             return
         
         await asyncio.sleep(0.5)
-        
         await send_typing(channel_id)
         await asyncio.sleep(0.3)
         await send_message(channel_id, msg_text)
-        log.info(f"Sent spontaneous message to {target_display_name} in {channel_id}: {msg_text}")
         last_spontaneous_time = now
     except Exception as e:
-        log.exception("Failed to generate/send spontaneous message")
+        log.exception("Failed to send spontaneous message")
 
 async def spontaneous_loop():
     while True:
@@ -660,9 +652,7 @@ async def change_avatar(image_data: bytes):
         mime = "image/png"
     
     b64 = base64.b64encode(image_data).decode()
-    payload = {
-        "avatar": f"data:{mime};base64,{b64}"
-    }
+    payload = {"avatar": f"data:{mime};base64,{b64}"}
     
     resp = await api_request("PATCH", "https://discord.com/api/v9/users/@me", json=payload)
     
@@ -674,7 +664,7 @@ async def change_avatar(image_data: bytes):
             error_msg = error_data.get('message', 'Brak szczegółów')
         except:
             error_msg = resp.text[:200]
-        return False, f"Nie udało się zmienić (status {resp.status_code}): {error_msg}"
+        return False, f"Nie udało się (status {resp.status_code}): {error_msg}"
 
 async def change_display_name(new_display: str):
     if len(new_display) < 2 or len(new_display) > 32:
@@ -682,14 +672,14 @@ async def change_display_name(new_display: str):
     payload = {"global_name": new_display}
     resp = await api_request("PATCH", "https://discord.com/api/v9/users/@me", json=payload)
     if resp.status_code == 200:
-        return True, f"Zmieniono display name na: {new_display}"
+        return True, f"Zmieniono na: {new_display}"
     else:
         try:
             error_data = resp.json()
             error_msg = error_data.get('message', 'Brak szczegółów')
         except:
             error_msg = resp.text[:100]
-        return False, f"Nie udało się zmienić display name (status {resp.status_code}): {error_msg}"
+        return False, f"Nie udało się (status {resp.status_code}): {error_msg}"
 
 # --------------------------------------------
 # MESSAGE QUEUE
@@ -705,7 +695,7 @@ async def rate_limiter():
             last_message_time = now
         if message_counter >= MAX_MESSAGES_PER_MINUTE:
             wait = 60 - (now - last_message_time) + random.uniform(1, 3)
-            log.warning(f"Rate limit hit. Sleeping {wait:.1f}s")
+            log.warning(f"Rate limit. Sleeping {wait:.1f}s")
             await asyncio.sleep(wait)
             message_counter = 0
             last_message_time = time.time()
@@ -764,7 +754,7 @@ async def handle_command(msg):
         return
 
     cmd = parts[0].lower()
-    log.info(f"Command: {cmd} from guild {current_guild}, channel {channel_id}")
+    log.info(f"Command: {cmd} from guild {current_guild}")
 
     if cmd == ".test" or cmd == ".ping":
         status = "ws: ok" if current_ws else "ws: None"
@@ -808,7 +798,7 @@ async def handle_command(msg):
                         if resp.status == 200:
                             image_data = await resp.read()
                         else:
-                            await send_reply(channel_id, msg_id, f"nie udalo sie pobrac zalacznika (status {resp.status})")
+                            await send_reply(channel_id, msg_id, f"nie udalo sie pobrac (status {resp.status})")
                             return
             except Exception as e:
                 log.exception("Failed to download attachment")
@@ -822,14 +812,14 @@ async def handle_command(msg):
                         if resp.status == 200:
                             image_data = await resp.read()
                         else:
-                            await send_reply(channel_id, msg_id, f"nie udalo sie pobrac obrazu (status {resp.status})")
+                            await send_reply(channel_id, msg_id, f"nie udalo sie pobrac (status {resp.status})")
                             return
             except Exception as e:
-                log.exception("Failed to download image from URL")
-                await send_reply(channel_id, msg_id, "nie moge pobrac obrazu z podanego URL")
+                log.exception("Failed to download image")
+                await send_reply(channel_id, msg_id, "nie moge pobrac obrazu")
                 return
         else:
-            await send_reply(channel_id, msg_id, "uzyj: .avatar (z zalacznikiem) lub .avatar <url_obrazu>")
+            await send_reply(channel_id, msg_id, "uzyj: .avatar (z zalacznikiem) lub .avatar <url>")
             return
 
         if image_data is None:
@@ -840,7 +830,7 @@ async def handle_command(msg):
         if success:
             await send_reply(channel_id, msg_id, message)
         else:
-            await send_reply(channel_id, msg_id, f"nie udalo sie zmienic avatara: {message}")
+            await send_reply(channel_id, msg_id, f"nie udalo sie: {message}")
         return
 
     if cmd == ".display":
@@ -852,13 +842,13 @@ async def handle_command(msg):
         if success:
             await send_reply(channel_id, msg_id, message)
         else:
-            await send_reply(channel_id, msg_id, f"nie udalo sie zmienic display name: {message}")
+            await send_reply(channel_id, msg_id, f"nie udalo sie: {message}")
         return
 
     if cmd == ".ignore":
         author_id = str(msg["author"]["id"])
         if author_id not in OWNER_IDS:
-            await send_reply(channel_id, msg_id, "nie masz uprawnien do tej komendy")
+            await send_reply(channel_id, msg_id, "nie masz uprawnien")
             return
         if len(parts) < 2:
             await send_reply(channel_id, msg_id, "uzycie: .ignore <user_id>")
@@ -870,13 +860,13 @@ async def handle_command(msg):
         ignored_users[target] = 0
         mention_timestamps.pop(target, None)
         log.info(f"Manually ignored user {target}")
-        await send_reply(channel_id, msg_id, f"uzytkownik {target} zostal zignorowany na stale")
+        await send_reply(channel_id, msg_id, f"uzytkownik {target} zignorowany na stale")
         return
 
     if cmd == ".unignore":
         author_id = str(msg["author"]["id"])
         if author_id not in OWNER_IDS:
-            await send_reply(channel_id, msg_id, "nie masz uprawnien do tej komendy")
+            await send_reply(channel_id, msg_id, "nie masz uprawnien")
             return
         if len(parts) < 2:
             await send_reply(channel_id, msg_id, "uzycie: .unignore <user_id>")
@@ -887,8 +877,8 @@ async def handle_command(msg):
             return
         if target in ignored_users:
             del ignored_users[target]
-            log.info(f"Manually unignored user {target}")
-            await send_reply(channel_id, msg_id, f"uzytkownik {target} zostal usuniety z ignorowanych")
+            log.info(f"Unignored user {target}")
+            await send_reply(channel_id, msg_id, f"uzytkownik {target} usuniety z ignorowanych")
         else:
             await send_reply(channel_id, msg_id, f"uzytkownik {target} nie jest ignorowany")
         return
@@ -896,7 +886,7 @@ async def handle_command(msg):
     if cmd == ".ignorelist":
         author_id = str(msg["author"]["id"])
         if author_id not in OWNER_IDS:
-            await send_reply(channel_id, msg_id, "nie masz uprawnien do tej komendy")
+            await send_reply(channel_id, msg_id, "nie masz uprawnien")
             return
         if not ignored_users:
             await send_reply(channel_id, msg_id, "brak ignorowanych uzytkownikow")
@@ -912,7 +902,7 @@ async def handle_command(msg):
         return
 
     if current_ws is None:
-        await send_reply(channel_id, msg_id, "websocket nieaktywny, sprobuj ponownie za chwile")
+        await send_reply(channel_id, msg_id, "websocket nieaktywny")
         return
 
     if cmd == ".join":
@@ -999,9 +989,9 @@ async def handle_command(msg):
             return
 
         if guild_id in voice_channels:
-            await send_reply(channel_id, msg_id, f"jestem w <#{voice_channels[guild_id]}> na serwerze {guild_id}")
+            await send_reply(channel_id, msg_id, f"jestem w <#{voice_channels[guild_id]}> w {guild_id}")
         else:
-            await send_reply(channel_id, msg_id, f"nie jestem w voice na serwerze {guild_id}")
+            await send_reply(channel_id, msg_id, f"nie jestem w voice na {guild_id}")
         return
 
 # --------------------------------------------
@@ -1017,15 +1007,12 @@ async def handle_message(msg):
         return
 
     if is_ignored(author_id):
-        log.debug(f"Ignoring message from ignored user {author_id}")
+        log.debug(f"Ignoring user {author_id}")
         return
 
     if content.startswith("."):
         if author_id in OWNER_IDS or (self_user_id and author_id == self_user_id):
-            log.info(f"Processing command from owner: {content}")
             await handle_command(msg)
-        else:
-            log.info(f"Ignoring command from {author_id} (not owner)")
         return
 
     channel_id = msg["channel_id"]
@@ -1046,7 +1033,7 @@ async def handle_message(msg):
         return
 
     if check_mention_spam(author_id):
-        log.info(f"User {author_id} auto-ignored due to spam, dropping this message")
+        log.info(f"User {author_id} auto-ignored due to spam")
         return
 
     await send_typing(channel_id)
@@ -1062,46 +1049,37 @@ async def handle_message(msg):
 
     try:
         if image_data:
-            log.info("Processing message with image")
+            log.info("Processing image")
             try:
-                # Prepare and compress image
-                image_bytes, mime_type = prepare_image_for_gemini(image_data)
+                image_bytes, mime_type = fast_prepare_image(image_data)
                 
                 if image_bytes is None:
-                    log.info("Could not prepare image - using text-only response")
                     prompt = f"Kontekst:\n{context}\n\nOdpowiedz na ostatnia wiadomosc. Uzytkownik wyslal obrazek ale nie moge go przeczytac."
                     reply_text = get_gemini_response(prompt)
                     if not reply_text:
                         return
                 else:
-                    log.info(f"Processing compressed image: {len(image_bytes)} bytes")
                     img = Image.open(io.BytesIO(image_bytes))
-                    
-                    prompt = f"Kontekst:\n{context}\n\nOdpowiedz na ostatnia wiadomosc. Mow wulgarnie i agresywnie, ale odnos sie do tresci obrazka jesli jest istotny."
+                    prompt = f"Kontekst:\n{context}\n\nOdpowiedz na ostatnia wiadomosc. Mow wulgarnie i agresywnie, ale odnos sie do tresci obrazka."
                     reply_text = get_gemini_response(prompt, img)
                     
                     if not reply_text:
-                        log.info("Gemini returned empty response - skipping reply.")
                         return
-                    log.info(f"Gemini response: {reply_text[:100]}...")
             except Exception as e:
-                log.exception(f"Error processing image with Gemini: {e}")
-                prompt = f"Kontekst:\n{context}\n\nOdpowiedz na ostatnia wiadomosc. Uzytkownik wyslal obrazek ale nie moge go przeczytac."
+                log.exception(f"Image error: {e}")
+                prompt = f"Kontekst:\n{context}\n\nOdpowiedz na ostatnia wiadomosc."
                 reply_text = get_gemini_response(prompt)
                 if not reply_text:
                     return
         else:
-            log.info("Processing text-only message")
             prompt = f"Kontekst:\n{context}\n\nOdpowiedz na ostatnia wiadomosc."
             reply_text = get_gemini_response(prompt)
             if not reply_text:
-                log.info("Gemini returned empty response - skipping reply.")
                 return
     except Exception as e:
-        log.exception("AI failed - skipping reply.")
+        log.exception("AI failed")
         return
 
-    # Send the response
     for i in range(0, len(reply_text), 1900):
         chunk = reply_text[i:i+1900]
         await send_reply(channel_id, msg_id, chunk)
@@ -1125,18 +1103,15 @@ async def filter_and_queue(msg):
         return
 
     if is_ignored(author_id):
-        log.debug(f"Dropping message from ignored user {author_id}")
         return
 
     if content.startswith("."):
         if author_id in OWNER_IDS or (self_user_id and author_id == self_user_id):
-            log.info(f"Queueing command from owner: {content}")
             await message_queue.put(msg)
         return
 
     channel_type = msg.get("channel_type")
     if channel_type in ("DM", "GROUP_DM"):
-        log.info(f"DM from {msg['author']['username']} -> queue")
         await message_queue.put(msg)
         return
     
@@ -1148,7 +1123,6 @@ async def filter_and_queue(msg):
             replied = True
     
     if mentioned or replied:
-        log.info(f"Message (mention/reply) from {msg['author']['username']} -> queue")
         await message_queue.put(msg)
 
 # --------------------------------------------
@@ -1161,11 +1135,9 @@ async def voice_keepalive():
         if not voice_channels and not persistent_voice_channels:
             continue
         if current_ws is None:
-            log.warning("Voice keepalive: WebSocket is None, skipping")
             continue
         for guild_id, channel_id in list(persistent_voice_channels.items()):
             if guild_id not in voice_channels:
-                log.info(f"Voice keepalive: re-joining guild {guild_id} -> {channel_id}")
                 try:
                     await current_ws.send(json.dumps({
                         "op": 4,
@@ -1178,7 +1150,7 @@ async def voice_keepalive():
                     }))
                     voice_channels[guild_id] = channel_id
                 except Exception as e:
-                    log.warning(f"Voice keepalive re-join error for {guild_id}: {e}")
+                    log.warning(f"Voice keepalive error for {guild_id}: {e}")
         for guild_id, channel_id in list(voice_channels.items()):
             try:
                 await current_ws.send(json.dumps({
@@ -1190,9 +1162,8 @@ async def voice_keepalive():
                         "self_deaf": False
                     }
                 }))
-                log.debug(f"Keepalive voice update for guild {guild_id} -> {channel_id}")
             except Exception as e:
-                log.warning(f"Voice keepalive error for guild {guild_id}: {e}")
+                log.warning(f"Voice keepalive error for {guild_id}: {e}")
 
 # --------------------------------------------
 # WEBSOCKET LOGIC
@@ -1239,7 +1210,7 @@ async def listen():
                     "compress": False
                 }
             }))
-            log.info("Identify sent (no intents)")
+            log.info("Identify sent")
         
         keepalive_task = asyncio.create_task(voice_keepalive())
         spontaneous_task = asyncio.create_task(spontaneous_loop())
@@ -1273,8 +1244,6 @@ async def listen():
                     session_id = None
                     resume_gateway_url = None
                     break
-                elif op == 11:
-                    pass
             except websockets.exceptions.ConnectionClosed as e:
                 log.error(f"Closed: {e}")
                 break
@@ -1302,7 +1271,7 @@ async def main():
     global self_user_id
     resp = await api_request("GET", "https://discord.com/api/v9/users/@me")
     if resp.status_code != 200:
-        log.error("Token invalid! Get a fresh one.")
+        log.error("Token invalid!")
         return
     self_user_id = str(resp.json()["id"])
     log.info(f"Token valid. ID: {self_user_id}")
