@@ -144,7 +144,7 @@ def get_gemini_response(prompt, image=None):
         return None
 
 # --------------------------------------------
-# SUPPORTED IMPERSONATIONS - ONLY THESE WORK
+# SUPPORTED IMPERSONATIONS
 # --------------------------------------------
 SUPPORTED_IMPERSONATIONS = ["chrome120", "chrome123", "chrome124", "chrome126"]
 
@@ -202,7 +202,7 @@ def get_dynamic_headers():
 # ASYNC API REQUEST
 # --------------------------------------------
 session = requests.Session()
-session.impersonate = "chrome120"  # Default
+session.impersonate = "chrome120"
 
 async def api_request(method, url, **kwargs):
     while True:
@@ -210,7 +210,6 @@ async def api_request(method, url, **kwargs):
         if 'headers' in kwargs:
             headers.update(kwargs.pop('headers'))
         
-        # Randomly change impersonation sometimes
         if random.random() < 0.3:
             session.impersonate = get_supported_impersonate()
         
@@ -248,20 +247,44 @@ async def send_message(channel_id, content):
 # IMAGE ANALYSIS HELPERS
 # --------------------------------------------
 def is_static_image(image_data):
+    """Check if image is static (not animated) - for GIFs, check if all frames are identical"""
     try:
-        if image_data.startswith(b'GIF'):
-            try:
-                with Image.open(io.BytesIO(image_data)) as img:
-                    if getattr(img, 'is_animated', False):
-                        return False
-                    return True
-            except:
-                return False
-        try:
-            with Image.open(io.BytesIO(image_data)) as img:
+        with Image.open(io.BytesIO(image_data)) as img:
+            # For non-GIF formats, it's static
+            if not getattr(img, 'is_animated', False):
                 return True
-        except:
-            return False
+            
+            # For animated GIFs, check if all frames are identical
+            try:
+                # Get first frame
+                img.seek(0)
+                first_frame = img.convert('RGB')
+                first_frame_data = first_frame.tobytes()
+                n_frames = getattr(img, 'n_frames', 1)
+                
+                if n_frames <= 1:
+                    return True
+                
+                # Check if all frames are the same
+                is_static = True
+                for i in range(1, n_frames):
+                    img.seek(i)
+                    current_frame = img.convert('RGB')
+                    if current_frame.tobytes() != first_frame_data:
+                        is_static = False
+                        break
+                
+                if is_static:
+                    log.info("Detected static GIF (all frames identical)")
+                else:
+                    log.info("Detected animated GIF (frames differ)")
+                return is_static
+                    
+            except Exception as e:
+                # If we can't check frames, treat as static
+                log.warning(f"Could not check GIF frames, treating as static: {e}")
+                return True
+                
     except Exception as e:
         log.warning(f"Error checking image: {e}")
         return False
@@ -277,31 +300,63 @@ async def download_image(url):
     return None
 
 def prepare_image_for_gemini(image_data):
+    """Prepare image for Gemini API - returns None for animated GIFs"""
     try:
-        if image_data.startswith(b'\xff\xd8'):
-            mime_type = "image/jpeg"
-        elif image_data.startswith(b'\x89PNG'):
-            mime_type = "image/png"
-        elif image_data.startswith(b'GIF'):
-            mime_type = "image/gif"
-        else:
-            mime_type = "image/jpeg"
-        
-        if image_data.startswith(b'GIF'):
-            try:
-                with Image.open(io.BytesIO(image_data)) as img:
-                    if getattr(img, 'is_animated', False):
+        with Image.open(io.BytesIO(image_data)) as img:
+            # If it's a GIF
+            if getattr(img, 'format', '').upper() == 'GIF':
+                is_animated = getattr(img, 'is_animated', False)
+                
+                if is_animated:
+                    # Check if all frames are identical (static GIF)
+                    try:
                         img.seek(0)
+                        first_frame = img.convert('RGB')
+                        first_frame_data = first_frame.tobytes()
+                        n_frames = getattr(img, 'n_frames', 1)
+                        
+                        is_static = True
+                        for i in range(1, n_frames):
+                            img.seek(i)
+                            current_frame = img.convert('RGB')
+                            if current_frame.tobytes() != first_frame_data:
+                                is_static = False
+                                break
+                        
+                        if is_static:
+                            # Convert static GIF to PNG
+                            output = io.BytesIO()
+                            first_frame.save(output, format='PNG')
+                            log.info("Converted static GIF to PNG for Gemini")
+                            return output.getvalue(), "image/png"
+                        else:
+                            # Animated GIF - skip
+                            log.info("Skipping animated GIF")
+                            return None, None
+                    except Exception as e:
+                        log.warning(f"Error checking GIF frames: {e}")
+                        # Try first frame as fallback
                         output = io.BytesIO()
+                        img.seek(0)
                         img.convert('RGB').save(output, format='PNG')
                         return output.getvalue(), "image/png"
-            except Exception as e:
-                log.warning(f"Failed to extract static frame from GIF: {e}")
-        
-        return image_data, mime_type
+                else:
+                    # Static GIF (not animated)
+                    output = io.BytesIO()
+                    img.convert('RGB').save(output, format='PNG')
+                    return output.getvalue(), "image/png"
+            
+            # For other formats, return as-is
+            if image_data.startswith(b'\xff\xd8'):
+                return image_data, "image/jpeg"
+            elif image_data.startswith(b'\x89PNG'):
+                return image_data, "image/png"
+            else:
+                return image_data, "image/jpeg"
+                
     except Exception as e:
         log.warning(f"Error preparing image: {e}")
-        return image_data, "image/jpeg"
+        return None, None
 
 # --------------------------------------------
 # GLOBAL STATE
@@ -405,14 +460,17 @@ async def build_context(channel_id, current_msg, guild_id=None):
     image_data = None
     if current_msg.get("attachments"):
         for att in current_msg["attachments"]:
-            if att.get("content_type", "").startswith("image/"):
+            content_type = att.get("content_type", "")
+            if content_type.startswith("image/"):
                 image_data = await download_image(att["url"])
-                if image_data and is_static_image(image_data):
-                    has_image = True
-                    break
-                elif image_data:
-                    log.info("Skipping animated GIF")
-                    image_data = None
+                if image_data:
+                    if is_static_image(image_data):
+                        has_image = True
+                        log.info(f"Found static image in message: {att['filename']}")
+                        break
+                    else:
+                        log.info(f"Skipping non-static or animated image: {att['filename']}")
+                        image_data = None
     
     for m in reversed(channel_msgs):
         author = m["author"].get("global_name") or m["author"]["username"]
@@ -980,22 +1038,34 @@ async def handle_message(msg):
     try:
         if image_data:
             try:
+                # Prepare image - returns None for animated GIFs
                 image_bytes, mime_type = prepare_image_for_gemini(image_data)
-                img = Image.open(io.BytesIO(image_bytes))
                 
-                prompt = f"Kontekst:\n{context}\n\nOdpowiedz na ostatnia wiadomosc. Mow wulgarnie i agresywnie, ale odnos sie do tresci obrazka jesli jest istotny."
-                reply_text = get_gemini_response(prompt, img)
-                
-                if not reply_text:
-                    log.info("Gemini returned empty response - skipping reply.")
-                    return
+                if image_bytes is None:
+                    # Animated GIF - skip image analysis
+                    log.info("Skipping animated GIF - using text-only response")
+                    prompt = f"Kontekst:\n{context}\n\nOdpowiedz na ostatnia wiadomosc. Uzytkownik wyslal animowany gif, ignoruj go."
+                    reply_text = get_gemini_response(prompt)
+                    if not reply_text:
+                        return
+                else:
+                    # Process static image
+                    img = Image.open(io.BytesIO(image_bytes))
+                    
+                    prompt = f"Kontekst:\n{context}\n\nOdpowiedz na ostatnia wiadomosc. Mow wulgarnie i agresywnie, ale odnos sie do tresci obrazka jesli jest istotny."
+                    reply_text = get_gemini_response(prompt, img)
+                    
+                    if not reply_text:
+                        log.info("Gemini returned empty response - skipping reply.")
+                        return
             except Exception as e:
                 log.exception(f"Error processing image with Gemini: {e}")
-                prompt = f"Kontekst:\n{context}\n\nOdpowiedz na ostatnia wiadomosc. W obrazku jest cos, ale nie moge go odczytac. Odpowiedz wulgarnie i agresywnie."
+                prompt = f"Kontekst:\n{context}\n\nOdpowiedz na ostatnia wiadomosc. Uzytkownik wyslal obrazek ale nie moge go przeczytac. Odpowiedz wulgarnie i agresywnie."
                 reply_text = get_gemini_response(prompt)
                 if not reply_text:
                     return
         else:
+            # Text only
             prompt = f"Kontekst:\n{context}\n\nOdpowiedz na ostatnia wiadomosc."
             reply_text = get_gemini_response(prompt)
             if not reply_text:
