@@ -32,16 +32,16 @@ OWNER_IDS = [
 ]
 
 # Spontaneous messages settings
-SPONTANEOUS_CHANCE = 0.05
-SPONTANEOUS_COOLDOWN = 120
-SPONTANEOUS_CHECK_INTERVAL = 30
+SPONTANEOUS_CHANCE = 0.03
+SPONTANEOUS_COOLDOWN = 180
+SPONTANEOUS_CHECK_INTERVAL = 60
 SPONTANEOUS_CHANNEL_ID = "1458080496369139849"
 
-# Delay settings - bardziej ludzkie
-MIN_REPLY_DELAY = 0.8
-MAX_REPLY_DELAY = 2.5
-CHUNK_DELAY = 0.3
-MAX_MESSAGES_PER_MINUTE = 8
+# Faster delays
+MIN_REPLY_DELAY = 0.5
+MAX_REPLY_DELAY = 1.0
+CHUNK_DELAY = 0.1
+MAX_MESSAGES_PER_MINUTE = 10
 HISTORY_CACHE_TTL = 60
 MAX_HISTORY_PER_GUILD = 50
 
@@ -57,7 +57,6 @@ if not DISCORD_TOKEN or not GEMINI_API_KEY:
 def fetch_latest_build_info():
     try:
         url = "https://raw.githubusercontent.com/qoft/discord-api/main/fetch"
-        # Use a supported impersonation
         response = requests.get(url, timeout=10, impersonate="chrome120")
         response.raise_for_status()
         data = response.json()
@@ -79,10 +78,8 @@ LATEST_BUILD, LATEST_VERSION = fetch_latest_build_info()
 # --------------------------------------------
 # GEMINI SETUP - Using new google.genai
 # --------------------------------------------
-# Initialize the client
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-# Nowy prompt - wulgarny agresywny
 DEFAULT_SYSTEM_PROMPT = (
 "jestes wulgarnym agresywnym botem discord\n"
 "piszesz tylko malymi literami\n"
@@ -101,31 +98,21 @@ DEFAULT_SYSTEM_PROMPT = (
 
 current_system_prompt = DEFAULT_SYSTEM_PROMPT
 
-# For the new API, we'll pass system instruction with each request
 def get_gemini_response(prompt, image=None):
     """Get response from Gemini using the new API"""
     try:
-        # Prepare content parts
-        contents = []
-        
-        # Add system instruction as a user message with system context
         system_message = f"System: {current_system_prompt}\n\nUser: {prompt}"
         
         if image:
-            # For images, use the generate_content with image
-            # Convert PIL Image to bytes if needed
             if hasattr(image, 'read'):
-                # It's a file-like object
                 image_bytes = image.read()
             elif isinstance(image, Image.Image):
-                # It's a PIL Image
                 img_byte_arr = io.BytesIO()
                 image.save(img_byte_arr, format='PNG')
                 image_bytes = img_byte_arr.getvalue()
             else:
                 image_bytes = image
             
-            # Upload the image to Gemini
             uploaded_file = client.files.upload(
                 file=io.BytesIO(image_bytes),
                 config=types.UploadFileConfig(
@@ -133,7 +120,6 @@ def get_gemini_response(prompt, image=None):
                 )
             )
             
-            # Generate response with image
             response = client.models.generate_content(
                 model=GEMINI_MODEL,
                 contents=[
@@ -147,7 +133,6 @@ def get_gemini_response(prompt, image=None):
                 ]
             )
         else:
-            # Text only
             response = client.models.generate_content(
                 model=GEMINI_MODEL,
                 contents=system_message
@@ -159,21 +144,21 @@ def get_gemini_response(prompt, image=None):
         return None
 
 # --------------------------------------------
-# DYNAMIC HEADER GENERATION - Only supported impersonations
+# SUPPORTED IMPERSONATIONS - ONLY THESE WORK
 # --------------------------------------------
-def get_random_user_agent():
-    """Zwraca losowy user-agent, aby wyglądać jak różne przeglądarki"""
-    user_agents = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
-    ]
-    return random.choice(user_agents)
+SUPPORTED_IMPERSONATIONS = ["chrome120", "chrome123", "chrome124", "chrome126"]
 
 def get_supported_impersonate():
-    """Return only supported impersonation strings"""
-    return random.choice(["chrome120", "chrome121", "chrome119", "chrome118"])
+    return random.choice(SUPPORTED_IMPERSONATIONS)
+
+def get_random_user_agent():
+    user_agents = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    ]
+    return random.choice(user_agents)
 
 def get_dynamic_headers():
     user_agent = get_random_user_agent()
@@ -184,43 +169,40 @@ def get_dynamic_headers():
         "os": "Windows",
         "browser": "Chrome",
         "device": "",
-        "system_locale": random.choice(["en-US", "pl-PL", "en-GB"]),
+        "system_locale": "en-US",
         "browser_user_agent": user_agent,
-        "browser_version": "120.0.6099.216" if "Chrome" in user_agent else "121.0.0.0",
+        "browser_version": "120.0.6099.216",
         "os_version": "10.0.19045",
         "referrer": "",
         "referring_domain": "",
         "referrer_current": "",
         "referring_domain_current": "",
-        "release_channel": random.choice(["stable", "canary", "ptb"]),
+        "release_channel": "stable",
         "client_build_number": current_build,
         "client_event_source": None
     }
     super_properties = base64.b64encode(json.dumps(properties, separators=(',', ':')).encode()).decode()
-    
-    time.sleep(random.uniform(0.01, 0.05))
     
     return {
         "Authorization": DISCORD_TOKEN,
         "User-Agent": user_agent,
         "X-Super-Properties": super_properties,
         "Accept": "*/*",
-        "Accept-Language": random.choice(["en-US,en;q=0.9", "pl-PL,pl;q=0.9,en;q=0.8", "en-US,en;q=0.9,pl;q=0.8"]),
+        "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate, br",
         "Connection": "keep-alive",
         "Sec-Fetch-Dest": "empty",
         "Sec-Fetch-Mode": "cors",
         "Sec-Fetch-Site": "same-origin",
-        "Cache-Control": random.choice(["no-cache", "max-age=0"]),
-        "Pragma": random.choice(["no-cache", ""]),
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
     }
 
 # --------------------------------------------
 # ASYNC API REQUEST
 # --------------------------------------------
 session = requests.Session()
-# Use only supported impersonations
-session.impersonate = get_supported_impersonate()
+session.impersonate = "chrome120"  # Default
 
 async def api_request(method, url, **kwargs):
     while True:
@@ -228,17 +210,15 @@ async def api_request(method, url, **kwargs):
         if 'headers' in kwargs:
             headers.update(kwargs.pop('headers'))
         
-        await asyncio.sleep(random.uniform(0.1, 0.5))
-        
-        # Update session impersonation randomly
-        session.impersonate = get_supported_impersonate()
+        # Randomly change impersonation sometimes
+        if random.random() < 0.3:
+            session.impersonate = get_supported_impersonate()
         
         resp = await asyncio.to_thread(session.request, method, url, headers=headers, **kwargs)
         if resp.status_code == 429:
             retry = resp.json().get('retry_after', 2)
-            retry += random.uniform(0.5, 1.5)
             log.warning(f"Rate limited. Sleeping {retry}s")
-            await asyncio.sleep(retry)
+            await asyncio.sleep(retry + 0.5)
             continue
         return resp
 
@@ -246,7 +226,6 @@ async def api_request(method, url, **kwargs):
 # ASYNC HELPERS
 # --------------------------------------------
 async def send_typing(channel_id):
-    await asyncio.sleep(random.uniform(0.2, 0.8))
     await api_request("POST", f"https://discord.com/api/v9/channels/{channel_id}/typing")
 
 async def send_reply(channel_id, reply_to_id, content):
@@ -269,7 +248,6 @@ async def send_message(channel_id, content):
 # IMAGE ANALYSIS HELPERS
 # --------------------------------------------
 def is_static_image(image_data):
-    """Check if image is static (not animated)"""
     try:
         if image_data.startswith(b'GIF'):
             try:
@@ -289,7 +267,6 @@ def is_static_image(image_data):
         return False
 
 async def download_image(url):
-    """Download image from URL"""
     try:
         async with aiohttp.ClientSession() as sess:
             async with sess.get(url) as resp:
@@ -300,7 +277,6 @@ async def download_image(url):
     return None
 
 def prepare_image_for_gemini(image_data):
-    """Prepare image for Gemini API"""
     try:
         if image_data.startswith(b'\xff\xd8'):
             mime_type = "image/jpeg"
@@ -419,7 +395,7 @@ async def get_cached_channel_history(channel_id, before_id):
     return []
 
 # --------------------------------------------
-# CONTEXT BUILDER (async) - with image support
+# CONTEXT BUILDER (async)
 # --------------------------------------------
 async def build_context(channel_id, current_msg, guild_id=None):
     lines = []
@@ -503,7 +479,7 @@ async def send_spontaneous_message():
     target_display_name = None
     target_content = None
     try:
-        url = f"https://discord.com/api/v9/channels/{channel_id}/messages?limit=50"
+        url = f"https://discord.com/api/v9/channels/{channel_id}/messages?limit=20"
         headers = get_dynamic_headers()
         resp = await asyncio.to_thread(session.get, url, headers=headers)
         if resp.status_code == 200:
@@ -532,7 +508,7 @@ async def send_spontaneous_message():
                 msg = reply.strip()
                 if msg:
                     await send_typing(channel_id)
-                    await asyncio.sleep(random.uniform(0.5, 1.5))
+                    await asyncio.sleep(0.5)
                     await send_message(channel_id, msg)
                     last_spontaneous_time = now
         except Exception as e:
@@ -542,7 +518,7 @@ async def send_spontaneous_message():
     try:
         ping_msg = f"@{target_display_name}"
         await send_typing(channel_id)
-        await asyncio.sleep(random.uniform(0.3, 1.0))
+        await asyncio.sleep(0.3)
         await send_message(channel_id, ping_msg)
         log.info(f"Sent ping to {target_display_name} in {channel_id}")
         
@@ -560,10 +536,10 @@ async def send_spontaneous_message():
         if not msg_text:
             return
         
-        await asyncio.sleep(random.uniform(0.8, 2.0))
+        await asyncio.sleep(0.5)
         
         await send_typing(channel_id)
-        await asyncio.sleep(random.uniform(0.3, 0.8))
+        await asyncio.sleep(0.3)
         await send_message(channel_id, msg_text)
         log.info(f"Sent spontaneous message to {target_display_name} in {channel_id}: {msg_text}")
         last_spontaneous_time = now
@@ -572,7 +548,7 @@ async def send_spontaneous_message():
 
 async def spontaneous_loop():
     while True:
-        await asyncio.sleep(SPONTANEOUS_CHECK_INTERVAL + random.uniform(-5, 5))
+        await asyncio.sleep(SPONTANEOUS_CHECK_INTERVAL)
         await send_spontaneous_message()
 
 # --------------------------------------------
@@ -645,12 +621,12 @@ async def rate_limiter():
             message_counter = 0
             last_message_time = now
         if message_counter >= MAX_MESSAGES_PER_MINUTE:
-            wait = 60 - (now - last_message_time) + random.uniform(2, 5)
+            wait = 60 - (now - last_message_time) + random.uniform(1, 3)
             log.warning(f"Rate limit hit. Sleeping {wait:.1f}s")
             await asyncio.sleep(wait)
             message_counter = 0
             last_message_time = time.time()
-        await asyncio.sleep(random.uniform(0.5, 1.5))
+        await asyncio.sleep(0.1)
 
 async def process_worker():
     while True:
@@ -946,7 +922,7 @@ async def handle_command(msg):
         return
 
 # --------------------------------------------
-# HANDLE MESSAGE - with image support
+# HANDLE MESSAGE
 # --------------------------------------------
 async def handle_message(msg):
     global self_user_id
@@ -990,8 +966,6 @@ async def handle_message(msg):
         log.info(f"User {author_id} auto-ignored due to spam, dropping this message")
         return
 
-    await asyncio.sleep(random.uniform(MIN_REPLY_DELAY, MAX_REPLY_DELAY))
-    
     await send_typing(channel_id)
     
     context, image_data = await build_context(channel_id, msg, guild_id)
@@ -1035,7 +1009,7 @@ async def handle_message(msg):
         chunk = reply_text[i:i+1900]
         await send_reply(channel_id, msg_id, chunk)
         if i + 1900 < len(reply_text):
-            await asyncio.sleep(CHUNK_DELAY + random.uniform(0.1, 0.3))
+            await asyncio.sleep(CHUNK_DELAY)
 
 # --------------------------------------------
 # FILTER
@@ -1086,7 +1060,7 @@ async def filter_and_queue(msg):
 async def voice_keepalive():
     global current_ws, voice_channels, persistent_voice_channels
     while True:
-        await asyncio.sleep(60 + random.uniform(-10, 10))
+        await asyncio.sleep(60)
         if not voice_channels and not persistent_voice_channels:
             continue
         if current_ws is None:
@@ -1158,10 +1132,10 @@ async def listen():
                         "$device": "Chrome",
                         "$referring_domain": "",
                         "$referrer_url": "",
-                        "$client_build_number": LATEST_BUILD + random.randint(-20, 20),
+                        "$client_build_number": LATEST_BUILD,
                         "$client_version": LATEST_VERSION,
                         "$os_version": "10.0.19045",
-                        "$system_locale": random.choice(["en-US", "pl-PL"]),
+                        "$system_locale": "en-US",
                         "$browser_version": "120.0.6099.216"
                     },
                     "large_threshold": 250,
@@ -1217,9 +1191,8 @@ async def listen():
 # HEARTBEAT
 # --------------------------------------------
 async def heartbeat(ws, interval):
-    jitter = random.uniform(-0.5, 0.5)
     while True:
-        await asyncio.sleep((interval / 1000.0) + jitter)
+        await asyncio.sleep(interval / 1000.0)
         try:
             await ws.send(json.dumps({"op": 1, "d": None}))
         except:
@@ -1247,7 +1220,7 @@ async def main():
         except Exception as e:
             log.exception("Crashed")
         log.info(f"Reconnecting in {backoff}s...")
-        await asyncio.sleep(backoff + random.uniform(0, 2))
+        await asyncio.sleep(backoff)
         backoff = min(backoff * 2, 60)
 
 if __name__ == "__main__":
