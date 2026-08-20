@@ -23,7 +23,7 @@ load_dotenv()
 # --------------------------------------------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")  # Read from .env
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 # Multiple owners
 OWNER_IDS = [
@@ -256,46 +256,19 @@ async def send_message(channel_id, content):
     return resp.status_code == 200
 
 # --------------------------------------------
-# IMAGE ANALYSIS HELPERS
+# IMAGE ANALYSIS HELPERS - NO GIF SUPPORT
 # --------------------------------------------
-def is_static_image(image_data):
-    """Check if image is static (not animated) - for GIFs, check if all frames are identical"""
+def is_supported_image_format(image_data):
+    """Check if image is a supported format (PNG, JPG, JPEG, WEBP)"""
     try:
         with Image.open(io.BytesIO(image_data)) as img:
-            # For non-GIF formats, it's static
-            if not getattr(img, 'is_animated', False):
-                return True
-            
-            # For animated GIFs, check if all frames are identical
-            try:
-                img.seek(0)
-                first_frame = img.convert('RGB')
-                first_frame_data = first_frame.tobytes()
-                n_frames = getattr(img, 'n_frames', 1)
-                
-                if n_frames <= 1:
-                    return True
-                
-                is_static = True
-                for i in range(1, n_frames):
-                    img.seek(i)
-                    current_frame = img.convert('RGB')
-                    if current_frame.tobytes() != first_frame_data:
-                        is_static = False
-                        break
-                
-                if is_static:
-                    log.info("Detected static GIF (all frames identical)")
-                else:
-                    log.info("Detected animated GIF (frames differ)")
-                return is_static
-                    
-            except Exception as e:
-                log.warning(f"Could not check GIF frames, treating as static: {e}")
-                return True
-                
+            fmt = img.format.upper() if img.format else ""
+            supported = fmt in ['PNG', 'JPEG', 'WEBP']
+            if not supported:
+                log.info(f"Unsupported image format: {fmt} (skipping)")
+            return supported
     except Exception as e:
-        log.warning(f"Error checking image: {e}")
+        log.warning(f"Error checking image format: {e}")
         return False
 
 async def download_image(url):
@@ -309,52 +282,14 @@ async def download_image(url):
     return None
 
 def prepare_image_for_gemini(image_data):
-    """Prepare image for Gemini API - returns None for animated GIFs"""
+    """Prepare image for Gemini API - PNG, JPG, WEBP only"""
     try:
         with Image.open(io.BytesIO(image_data)) as img:
-            # Always convert to RGB and PNG for consistency
-            if getattr(img, 'format', '').upper() == 'GIF':
-                is_animated = getattr(img, 'is_animated', False)
-                
-                if is_animated:
-                    try:
-                        img.seek(0)
-                        first_frame = img.convert('RGB')
-                        first_frame_data = first_frame.tobytes()
-                        n_frames = getattr(img, 'n_frames', 1)
-                        
-                        is_static = True
-                        for i in range(1, n_frames):
-                            img.seek(i)
-                            current_frame = img.convert('RGB')
-                            if current_frame.tobytes() != first_frame_data:
-                                is_static = False
-                                break
-                        
-                        if is_static:
-                            output = io.BytesIO()
-                            first_frame.save(output, format='PNG')
-                            log.info("Converted static GIF to PNG for Gemini")
-                            return output.getvalue(), "image/png"
-                        else:
-                            log.info("Skipping animated GIF")
-                            return None, None
-                    except Exception as e:
-                        log.warning(f"Error checking GIF frames: {e}")
-                        output = io.BytesIO()
-                        img.seek(0)
-                        img.convert('RGB').save(output, format='PNG')
-                        return output.getvalue(), "image/png"
-                else:
-                    output = io.BytesIO()
-                    img.convert('RGB').save(output, format='PNG')
-                    return output.getvalue(), "image/png"
-            
-            # For any other format, convert to PNG for consistency
+            # Convert to PNG for consistency
             output = io.BytesIO()
             img.convert('RGB').save(output, format='PNG')
+            log.info(f"Converted {img.format} to PNG for Gemini")
             return output.getvalue(), "image/png"
-                
     except Exception as e:
         log.warning(f"Error preparing image: {e}")
         return None, None
@@ -451,7 +386,7 @@ async def get_cached_channel_history(channel_id, before_id):
     return []
 
 # --------------------------------------------
-# CONTEXT BUILDER (async)
+# CONTEXT BUILDER (async) - No GIF support
 # --------------------------------------------
 async def build_context(channel_id, current_msg, guild_id=None):
     lines = []
@@ -460,24 +395,31 @@ async def build_context(channel_id, current_msg, guild_id=None):
     has_image = False
     image_data = None
     
-    # Check attachments in the current message
+    # Check attachments in the current message - only PNG, JPG, JPEG, WEBP
     if current_msg.get("attachments"):
         for att in current_msg["attachments"]:
             content_type = att.get("content_type", "")
+            filename = att.get("filename", "")
+            
+            # Skip GIFs
+            if content_type == "image/gif" or filename.lower().endswith('.gif'):
+                log.info(f"Skipping GIF: {filename}")
+                continue
+            
             if content_type.startswith("image/"):
-                log.info(f"Found image attachment: {att['filename']} with type {content_type}")
+                log.info(f"Found image attachment: {filename} with type {content_type}")
                 image_data = await download_image(att["url"])
                 if image_data:
                     log.info(f"Downloaded image: {len(image_data)} bytes")
-                    if is_static_image(image_data):
+                    if is_supported_image_format(image_data):
                         has_image = True
-                        log.info(f"✓ Static image detected: {att['filename']}")
+                        log.info(f"✓ Supported image detected: {filename}")
                         break
                     else:
-                        log.info(f"✗ Skipping animated image: {att['filename']}")
+                        log.info(f"✗ Unsupported image format: {filename}")
                         image_data = None
                 else:
-                    log.warning(f"Failed to download image: {att['filename']}")
+                    log.warning(f"Failed to download image: {filename}")
     
     for m in reversed(channel_msgs):
         author = m["author"].get("global_name") or m["author"]["username"]
@@ -638,8 +580,6 @@ async def change_avatar(image_data: bytes):
         mime = "image/jpeg"
     elif image_data.startswith(b'\x89PNG'):
         mime = "image/png"
-    elif image_data.startswith(b'GIF'):
-        mime = "image/gif"
     else:
         mime = "image/png"
     
@@ -1051,13 +991,13 @@ async def handle_message(msg):
                 image_bytes, mime_type = prepare_image_for_gemini(image_data)
                 
                 if image_bytes is None:
-                    log.info("Skipping animated GIF - using text-only response")
-                    prompt = f"Kontekst:\n{context}\n\nOdpowiedz na ostatnia wiadomosc. Uzytkownik wyslal animowany gif, ignoruj go."
+                    log.info("Could not prepare image - using text-only response")
+                    prompt = f"Kontekst:\n{context}\n\nOdpowiedz na ostatnia wiadomosc. Uzytkownik wyslal obrazek ale nie moge go przeczytac."
                     reply_text = get_gemini_response(prompt)
                     if not reply_text:
                         return
                 else:
-                    log.info(f"Processing static image: {len(image_bytes)} bytes")
+                    log.info(f"Processing image: {len(image_bytes)} bytes")
                     img = Image.open(io.BytesIO(image_bytes))
                     
                     prompt = f"Kontekst:\n{context}\n\nOdpowiedz na ostatnia wiadomosc. Mow wulgarnie i agresywnie, ale odnos sie do tresci obrazka jesli jest istotny."
@@ -1069,7 +1009,7 @@ async def handle_message(msg):
                     log.info(f"Gemini response: {reply_text[:100]}...")
             except Exception as e:
                 log.exception(f"Error processing image with Gemini: {e}")
-                prompt = f"Kontekst:\n{context}\n\nOdpowiedz na ostatnia wiadomosc. Uzytkownik wyslal obrazek ale nie moge go przeczytac. Odpowiedz wulgarnie i agresywnie."
+                prompt = f"Kontekst:\n{context}\n\nOdpowiedz na ostatnia wiadomosc. Uzytkownik wyslal obrazek ale nie moge go przeczytac."
                 reply_text = get_gemini_response(prompt)
                 if not reply_text:
                     return
