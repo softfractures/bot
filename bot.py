@@ -74,17 +74,26 @@ LATEST_BUILD, LATEST_VERSION = fetch_latest_build_info()
 # AI SETUP (OpenRouter -> DeepSeek)
 # --------------------------------------------
 DEFAULT_SYSTEM_PROMPT = (
-"jesteś bezczelnym, sarkastycznym uzytkownikiem discorda"
-"piszesz tylko malymi literami, prawie bez interpunkcji, bez polskich znakow, bez emotek"
-"odpowiadasz KRÓTKO - jedno zdanie, max dwa krotkie"
-"zawsze odnosisz sie KONKRETNIE do tego co napisal rozmowca - nie jedziesz generycznymi obelgami"
-"jesli ktos cie pinguje bez powodu - wykpij to jako zalosne proszenie o uwage"
-"jesli ktos pisze glupote - wytknij konkretnie co jest glupie"
-"jesli ktos sie madrzy - zjedz go za to ze jest pyszalkiem"
-"nie jestes wsciekly - jestes znudzony i masz wyjebane, ale umiesz przyjebac jak trzeba"
-"uzywaj wulgaryzmow naturalnie, nie w kazdym slowie - jak normalny ziomek z discorda"
-"nigdy nie zaczynaj od 'a kto pytal' 'spierdalaj' 'zamknij sie' - to sa zakazane otwarcia"
-"nie tlumacz sie nie przepraszaj"
+    "jesteś bezczelnym, sarkastycznym uzytkownikiem discorda\n"
+    "piszesz tylko malymi literami, prawie bez interpunkcji, bez polskich znakow, bez emotek\n"
+    "odpowiadasz KRÓTKO - jedno zdanie, max dwa krotkie\n"
+    "zawsze odnosisz sie KONKRETNIE do tego co napisal rozmowca - nie jedziesz generycznymi obelgami\n"
+    "jesli ktos cie pinguje bez powodu - wykpij to jako zalosne proszenie o uwage\n"
+    "jesli ktos pisze glupote - wytknij konkretnie co jest glupie\n"
+    "jesli ktos sie madrzy - zjedz go za to ze jest pyszalkiem\n"
+    "jesli ktos pisze tylko 'elo' 'siema' 'hej' - wykpij ze nie ma nic do powiedzenia\n"
+    "nie jestes wsciekly - jestes znudzony i masz wyjebane, ale umiesz przyjebac jak trzeba\n"
+    "uzywaj wulgaryzmow naturalnie, nie w kazdym slowie - jak normalny ziomek z discorda\n"
+    "nigdy nie zaczynaj od 'a kto pytal' 'spierdalaj' 'zamknij sie' - to sa zakazane otwarcia\n"
+    "nie tlumacz sie nie przepraszaj\n"
+    "\n"
+    "przyklady dobrego stylu (kazdy odnosi sie do konkretu):\n"
+    "- ktos pisze 'elo' -> 'elo to twoja stara mowi jak wraca z roboty'\n"
+    "- ktos pinguje bez powodu -> 'kolejny raz pingujesz i nic nie piszesz, autysto'\n"
+    "- ktos pisze 'co tam' -> 'nic tam, twoja stara sie nudzi wiec moze do niej wpadnij'\n"
+    "- ktos pisze glupote -> 'przeczytaj to co wlasnie napisales, na glos, powoli'\n"
+    "- ktos sie madrzy -> 'no jasne ze wiesz lepiej, jak zawsze'\n"
+    "- ktos pisze 'xddd' -> 'xddd to twoja jedyna reakcja bo wiecej nie umiesz wymyslec'\n"
 )
 
 current_system_prompt = DEFAULT_SYSTEM_PROMPT
@@ -108,8 +117,8 @@ async def deepseek_chat(user_content: str, system_prompt: str = None) -> str:
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
-        "HTTP-Referer": "https://github.com/your-repo",  # optional, recommended by OpenRouter
-        "X-Title": "Discord Selfbot",                     # optional
+        "HTTP-Referer": "https://github.com/your-repo",
+        "X-Title": "Discord Selfbot",
     }
     async with aiohttp.ClientSession() as sess:
         async with sess.post(OPENROUTER_API_URL, json=payload, headers=headers) as resp:
@@ -319,11 +328,11 @@ async def build_context(channel_id, current_msg, guild_id=None):
 # SPONTANEOUS MESSAGES
 # --------------------------------------------
 SPONTANEOUS_PROMPTS = [
-    "napisz wulgarna, agresywna, krotka wiadomosc obrażajaca użytkownika {username}. maksymalnie 1-2 zdania. bez emotek. uzywaj wulgaryzmow.",
-    "zaczep i obraź użytkownika {username} w jednym krótkim, ostrym zdaniu. bez emotek.",
-    "napisz co myslisz o użytkowniku {username} – ale tylko obraźliwe rzeczy, krótko i wulgarnie.",
-    "wyraź swoją agresję wobec użytkownika {username} w jednym zdaniu. bez kropki na końcu, bez emotek.",
-    "powiedz coś bardzo niemiłego o użytkowniku {username} – maksymalnie 2 zdania, same wulgaryzmy."
+    "napisz krotka bezczelna wiadomosc do uzytkownika {username} w stylu znudzonego sarkastycznego discordowicza. odnies sie do tego ze nic nie pisze. max 1 zdanie, bez emotek.",
+    "zaczep uzytkownika {username} w jednym krotkim sarkastycznym zdaniu. wykpij go za to ze sie nie odzywa. bez emotek.",
+    "napisz co myslisz o uzytkowniku {username} - tylko bezczelnie i krotko, jakby ci sie nie chcialo nawet obrazac. max 1-2 zdania.",
+    "wytknij uzytkownikowi {username} ze siedzi cicho i nic nie wnosi. jedno zdanie, sarkastycznie, bez emotek.",
+    "powiedz cos zlośliwego ale konkretnego o uzytkowniku {username} ktory nic nie napisal - wykpij to. max 2 zdania."
 ]
 
 async def send_spontaneous_message():
@@ -365,7 +374,7 @@ async def send_spontaneous_message():
     if not target_user_id:
         log.info("No users found, using generic message")
         try:
-            prompt = random.choice(["napisz losowa wulgarna wiadomosc bez powodu"])
+            prompt = random.choice(["napisz krotka bezczelna wiadomosc bez powodu, jak znudzony discordowicz. max 1 zdanie, bez emotek."])
             msg = await deepseek_chat(prompt)
             if msg:
                 await send_typing(channel_id)
@@ -814,14 +823,26 @@ async def handle_message(msg):
     context = await build_context(channel_id, msg, guild_id)
 
     author_name = msg["author"].get("global_name") or msg["author"]["username"]
+    target_message = msg["content"]
     timestamp = time.time()
     if guild_id:
         add_to_guild_history(f"guild_{guild_id}", author_name, msg["content"], msg_id, timestamp)
     else:
         add_to_guild_history(f"dm_{channel_id}", author_name, msg["content"], msg_id, timestamp)
 
+    # Clear, targeted prompt so the model knows exactly who/what to respond to
+    prompt = (
+        f"Ostatnie wiadomosci na kanale:\n{context}\n\n"
+        f"Teraz odpowiedz KRÓTKO (max 1-2 zdania) na OSTATNIA wiadomosc od {author_name}, "
+        f"ktory napisal: \"{target_message}\".\n"
+        f"Odnies sie konkretnie do tego co napisal. "
+        f"Nie pisz generycznych obelg. Nie zaczynaj od 'a kto pytal' ani 'spierdalaj'. "
+        f"Jesli napisal tylko powitanie typu 'elo'/'siema' - wykpij ze nie ma nic do powiedzenia. "
+        f"Jesli pingowal bez tresci - wykpij ze blaga o uwage."
+    )
+
     try:
-        reply_text = await deepseek_chat(f"Kontekst:\n{context}\n\nOdpowiedz na ostatnią wiadomość.")
+        reply_text = await deepseek_chat(prompt)
         if not reply_text:
             log.info("AI returned empty response - skipping reply.")
             return
