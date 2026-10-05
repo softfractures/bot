@@ -6,19 +6,9 @@ import random
 import time
 import base64
 import aiohttp
-import google.generativeai as genai
 from dotenv import load_dotenv
 import websockets
 from curl_cffi import requests
-
-# ---- NOWY IMPORT ----
-try:
-    from PIL import Image
-    import io
-    HAS_PIL = True
-except ImportError:
-    HAS_PIL = False
-    print("UWAGA: Pillow nie jest zainstalowane – funkcja resize nie będzie działać!")
 
 load_dotenv()
 
@@ -26,8 +16,9 @@ load_dotenv()
 # CONFIGURATION
 # --------------------------------------------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
 
 # Multiple owners
 OWNER_IDS = [
@@ -41,18 +32,18 @@ SPONTANEOUS_COOLDOWN = 180
 SPONTANEOUS_CHECK_INTERVAL = 60
 SPONTANEOUS_CHANNEL_ID = "1458080496369139849"
 
-# Faster delays – dostosowane do szybszego odpowiadania
-MIN_REPLY_DELAY = 0.5          # wcześniej 2.0
-MAX_REPLY_DELAY = 1.0          # wcześniej 4.0
-CHUNK_DELAY = 0.1              # wcześniej 0.5
-MAX_MESSAGES_PER_MINUTE = 10   # ustawione na 10 (prośba użytkownika)
+# Faster delays
+MIN_REPLY_DELAY = 0.5
+MAX_REPLY_DELAY = 1.0
+CHUNK_DELAY = 0.1
+MAX_MESSAGES_PER_MINUTE = 10
 HISTORY_CACHE_TTL = 60
 MAX_HISTORY_PER_GUILD = 50
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("stealth-selfbot")
 
-if not DISCORD_TOKEN or not GEMINI_API_KEY:
+if not DISCORD_TOKEN or not DEEPSEEK_API_KEY:
     raise RuntimeError("Missing credentials in .env")
 
 # --------------------------------------------
@@ -80,10 +71,8 @@ def fetch_latest_build_info():
 LATEST_BUILD, LATEST_VERSION = fetch_latest_build_info()
 
 # --------------------------------------------
-# GEMINI SETUP
+# DEEPSEEK SETUP
 # --------------------------------------------
-genai.configure(api_key=GEMINI_API_KEY)
-
 DEFAULT_SYSTEM_PROMPT = (
 "jesteś wulgarnym agresywnym botem discord"
 "piszesz tylko małymi literami"
@@ -100,7 +89,37 @@ DEFAULT_SYSTEM_PROMPT = (
 )
 
 current_system_prompt = DEFAULT_SYSTEM_PROMPT
-model = genai.GenerativeModel(GEMINI_MODEL, system_instruction=current_system_prompt)
+
+# --------------------------------------------
+# DEEPSEEK CHAT REQUEST
+# --------------------------------------------
+async def deepseek_chat(user_content: str, system_prompt: str = None) -> str:
+    """Send a chat request to DeepSeek and return the assistant text."""
+    sys_prompt = system_prompt if system_prompt is not None else current_system_prompt
+    payload = {
+        "model": DEEPSEEK_MODEL,
+        "messages": [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": user_content},
+        ],
+        "stream": False,
+        "temperature": 1.1,
+        "max_tokens": 300,
+    }
+    headers = {
+        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    async with aiohttp.ClientSession() as sess:
+        async with sess.post(DEEPSEEK_API_URL, json=payload, headers=headers) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                raise RuntimeError(f"DeepSeek error {resp.status}: {text[:300]}")
+            data = await resp.json()
+    try:
+        return (data["choices"][0]["message"]["content"] or "").strip()
+    except (KeyError, IndexError) as e:
+        raise RuntimeError(f"Unexpected DeepSeek response: {data}") from e
 
 # --------------------------------------------
 # DYNAMIC HEADER GENERATION
@@ -196,45 +215,36 @@ guild_histories = {}
 channel_history_cache = {}
 
 # --------------------------------------------
-# IGNORE / SPAM DETECTION (NEW)
+# IGNORE / SPAM DETECTION
 # --------------------------------------------
-ignored_users = {}               # user_id -> expiry_timestamp (0 = permanent)
-mention_timestamps = {}          # user_id -> list of timestamps (for spam detection)
-SPAM_WINDOW = 5                  # seconds
-SPAM_THRESHOLD = 5               # mentions/replies in window
-AUTO_IGNORE_DURATION = 3600      # 1 hour
+ignored_users = {}
+mention_timestamps = {}
+SPAM_WINDOW = 5
+SPAM_THRESHOLD = 5
+AUTO_IGNORE_DURATION = 3600
 
 def is_ignored(user_id):
-    """Check if user is currently ignored (including expiry)."""
     if user_id not in ignored_users:
         return False
     expiry = ignored_users[user_id]
-    if expiry == 0:  # permanent
+    if expiry == 0:
         return True
     if time.time() < expiry:
         return True
-    # expired
     del ignored_users[user_id]
     return False
 
 def check_mention_spam(user_id):
-    """
-    Update mention timestamps and return True if spam threshold is exceeded.
-    If exceeded, automatically ignore the user for AUTO_IGNORE_DURATION.
-    """
     now = time.time()
     if user_id not in mention_timestamps:
         mention_timestamps[user_id] = []
     timestamps = mention_timestamps[user_id]
-    # Remove old entries
     timestamps = [t for t in timestamps if now - t <= SPAM_WINDOW]
     timestamps.append(now)
     mention_timestamps[user_id] = timestamps
     if len(timestamps) >= SPAM_THRESHOLD:
-        # Auto-ignore
         ignored_users[user_id] = now + AUTO_IGNORE_DURATION
         log.info(f"Auto-ignored user {user_id} for {AUTO_IGNORE_DURATION}s due to spam")
-        # Optionally clean up mention timestamps to avoid repeated triggers
         mention_timestamps[user_id] = []
         return True
     return False
@@ -260,7 +270,7 @@ def get_guild_history(key, limit=10):
     return guild_histories[key][-limit:]
 
 # --------------------------------------------
-# CACHED CHANNEL HISTORY (async)
+# CACHED CHANNEL HISTORY
 # --------------------------------------------
 async def get_cached_channel_history(channel_id, before_id):
     now = time.time()
@@ -278,7 +288,7 @@ async def get_cached_channel_history(channel_id, before_id):
     return []
 
 # --------------------------------------------
-# CONTEXT BUILDER (async)
+# CONTEXT BUILDER
 # --------------------------------------------
 async def build_context(channel_id, current_msg, guild_id=None):
     lines = []
@@ -286,20 +296,20 @@ async def build_context(channel_id, current_msg, guild_id=None):
     for m in reversed(channel_msgs):
         author = m["author"].get("global_name") or m["author"]["username"]
         lines.append(f"{author}: {m['content']}")
-    
+
     if guild_id:
         guild_key = f"guild_{guild_id}"
         guild_history = get_guild_history(guild_key, limit=10)
         for entry in guild_history:
             if entry["id"] != current_msg["id"]:
                 lines.append(f"[Guild memory] {entry['author']}: {entry['content']}")
-    
+
     if current_msg.get("referenced_message"):
         ref = current_msg["referenced_message"]
         if ref.get("content"):
             author = ref["author"].get("global_name") or ref["author"]["username"]
             lines.append(f"[Reply to] {author}: {ref['content']}")
-    
+
     author = current_msg["author"].get("global_name") or current_msg["author"]["username"]
     lines.append(f"{author}: {current_msg['content']}")
     return "\n".join(lines)
@@ -317,19 +327,19 @@ SPONTANEOUS_PROMPTS = [
 
 async def send_spontaneous_message():
     global last_spontaneous_time
-    
+
     channel_id = SPONTANEOUS_CHANNEL_ID
     if not channel_id:
         log.warning("No spontaneous channel ID set, skipping.")
         return
-    
+
     now = time.time()
     if now - last_spontaneous_time < SPONTANEOUS_COOLDOWN:
         return
-    
+
     if random.random() > SPONTANEOUS_CHANCE:
         return
-    
+
     target_user_id = None
     target_display_name = None
     try:
@@ -350,31 +360,25 @@ async def send_spontaneous_message():
                 target_user_id, target_display_name = random.choice(users)
     except Exception as e:
         log.warning(f"Failed to fetch users for spontaneous message: {e}")
-    
+
     if not target_user_id:
         log.info("No users found, using generic message")
         try:
             prompt = random.choice(["napisz losowa wulgarna wiadomosc bez powodu"])
-            reply = model.generate_content(prompt)
-            if reply.candidates:
-                msg = (reply.text or "").strip()
-                if msg:
-                    await send_typing(channel_id)
-                    await asyncio.sleep(0.5)  # krótkie opóźnienie dla naturalności
-                    await send_message(channel_id, msg)
-                    last_spontaneous_time = now
-        except Exception as e:
+            msg = await deepseek_chat(prompt)
+            if msg:
+                await send_typing(channel_id)
+                await asyncio.sleep(0.5)
+                await send_message(channel_id, msg)
+                last_spontaneous_time = now
+        except Exception:
             log.exception("Failed to send generic spontaneous message")
         return
-    
+
     try:
         prompt_template = random.choice(SPONTANEOUS_PROMPTS)
         prompt = prompt_template.format(username=target_display_name)
-        reply = model.generate_content(prompt)
-        if not reply.candidates:
-            log.warning("Gemini blocked spontaneous insult.")
-            return
-        insult = (reply.text or "").strip()
+        insult = await deepseek_chat(prompt)
         if not insult:
             return
         final_msg = f"{insult} <@{target_user_id}>"
@@ -383,7 +387,7 @@ async def send_spontaneous_message():
         await asyncio.sleep(0.5)
         await send_message(channel_id, final_msg)
         last_spontaneous_time = now
-    except Exception as e:
+    except Exception:
         log.exception("Failed to generate/send spontaneous insult")
 
 async def spontaneous_loop():
@@ -395,52 +399,14 @@ async def spontaneous_loop():
 # PROMPT MANAGEMENT
 # --------------------------------------------
 async def update_prompt(new_prompt):
-    global current_system_prompt, model
+    global current_system_prompt
     current_system_prompt = new_prompt
-    model = genai.GenerativeModel(GEMINI_MODEL, system_instruction=new_prompt)
     log.info("System prompt updated")
     return True
 
 # --------------------------------------------
-# PROFILE CHANGE FUNCTIONS (FIXED AVATAR)
+# DISPLAY NAME CHANGE (text only — no avatar)
 # --------------------------------------------
-async def change_avatar(image_data: bytes):
-    if len(image_data) > 256 * 1024:
-        return False, "Obraz jest za duży (max 256 KB)"
-    
-    # Detect MIME type
-    if image_data.startswith(b'\xff\xd8'):
-        mime = "image/jpeg"
-    elif image_data.startswith(b'\x89PNG'):
-        mime = "image/png"
-    elif image_data.startswith(b'GIF'):
-        mime = "image/gif"
-    else:
-        mime = "image/png"  # fallback
-    
-    b64 = base64.b64encode(image_data).decode()
-    payload = {
-        "avatar": f"data:{mime};base64,{b64}"
-    }
-    
-    # Debug: log first 100 chars of data URI
-    log.debug(f"Avatar data URI preview: {payload['avatar'][:100]}...")
-    
-    resp = await api_request("PATCH", "https://discord.com/api/v9/users/@me", json=payload)
-    
-    log.info(f"Avatar change response status: {resp.status_code}")
-    log.info(f"Avatar change response body: {resp.text[:500]}")
-    
-    if resp.status_code == 200:
-        return True, "Avatar zmieniony"
-    else:
-        try:
-            error_data = resp.json()
-            error_msg = error_data.get('message', 'Brak szczegółów')
-        except:
-            error_msg = resp.text[:200]
-        return False, f"Nie udało się zmienić (status {resp.status_code}): {error_msg}"
-
 async def change_display_name(new_display: str):
     if len(new_display) < 2 or len(new_display) > 32:
         return False, "Display name must be 2-32 characters"
@@ -452,43 +418,9 @@ async def change_display_name(new_display: str):
         try:
             error_data = resp.json()
             error_msg = error_data.get('message', 'Brak szczegółów')
-        except:
+        except Exception:
             error_msg = resp.text[:100]
         return False, f"Nie udało się zmienić display name (status {resp.status_code}): {error_msg}"
-
-# --------------------------------------------
-# NOWA FUNKCJA: RESIZE OBRAZU
-# --------------------------------------------
-def resize_image(image_data: bytes, max_size_bytes=256*1024) -> bytes:
-    """Zmniejsza obraz (jeśli trzeba) do podanego limitu rozmiaru (domyślnie 256 KB)."""
-    if not HAS_PIL:
-        raise RuntimeError("Pillow (PIL) nie jest zainstalowane – nie można przeskalować obrazu.")
-    
-    # Otwórz obraz
-    img = Image.open(io.BytesIO(image_data))
-    # Konwersja do RGB (JPEG nie obsługuje przezroczystości)
-    if img.mode in ('RGBA', 'LA', 'P'):
-        img = img.convert('RGB')
-    
-    # Zmniejsz wymiary, jeśli któreś przekracza 1024 px
-    max_dim = 1024
-    if img.width > max_dim or img.height > max_dim:
-        ratio = max_dim / max(img.width, img.height)
-        new_size = (int(img.width * ratio), int(img.height * ratio))
-        img = img.resize(new_size, Image.Resampling.LANCZOS)
-    
-    # Próbuj zapisać jako JPEG z różną jakością, aż zmieścimy się w limicie
-    buffer = io.BytesIO()
-    quality = 85
-    while True:
-        buffer.seek(0)
-        buffer.truncate()
-        img.save(buffer, format='JPEG', quality=quality, optimize=True)
-        size = buffer.tell()
-        if size <= max_size_bytes or quality <= 10:
-            break
-        quality -= 5
-    return buffer.getvalue()
 
 # --------------------------------------------
 # MESSAGE QUEUE
@@ -517,7 +449,7 @@ async def process_worker():
             global message_counter
             message_counter += 1
             await handle_message(msg)
-        except Exception as e:
+        except Exception:
             log.exception("Worker error")
         finally:
             message_queue.task_done()
@@ -551,8 +483,8 @@ async def restore_voice_channels():
 # VOICE COMMANDS HANDLER
 # --------------------------------------------
 async def handle_command(msg):
-    global current_ws, voice_channels, persistent_voice_channels, current_system_prompt, model
-    
+    global current_ws, voice_channels, persistent_voice_channels, current_system_prompt
+
     content = msg.get("content", "")
     channel_id = msg["channel_id"]
     current_guild = msg.get("guild_id")
@@ -600,65 +532,6 @@ async def handle_command(msg):
             await send_reply(channel_id, msg_id, "nie udalo sie przywrocic promptu")
         return
 
-    # -------------------- AVATAR CHANGE (POPRAWIONY) --------------------
-    if cmd == ".avatar":
-        image_data = None
-        if msg.get("attachments"):
-            att = msg["attachments"][0]
-            url = att["url"]
-            try:
-                async with aiohttp.ClientSession() as sess:
-                    async with sess.get(url) as resp:
-                        if resp.status == 200:
-                            image_data = await resp.read()
-                        else:
-                            await send_reply(channel_id, msg_id, f"nie udało się pobrać załącznika (status {resp.status})")
-                            return
-            except Exception as e:
-                log.exception("Failed to download attachment")
-                await send_reply(channel_id, msg_id, "nie mogę pobrać załącznika")
-                return
-        elif len(parts) >= 2:
-            img_url = parts[1]
-            try:
-                async with aiohttp.ClientSession() as sess:
-                    async with sess.get(img_url) as resp:
-                        if resp.status == 200:
-                            image_data = await resp.read()
-                        else:
-                            await send_reply(channel_id, msg_id, f"nie udało się pobrać obrazu (status {resp.status})")
-                            return
-            except Exception as e:
-                log.exception("Failed to download image from URL")
-                await send_reply(channel_id, msg_id, "nie mogę pobrać obrazu z podanego URL")
-                return
-        else:
-            await send_reply(channel_id, msg_id, "użyj: .avatar (z załącznikiem) lub .avatar <url_obrazu>")
-            return
-
-        if image_data is None:
-            await send_reply(channel_id, msg_id, "nie udało się pobrać obrazu")
-            return
-
-        # ---- RESIZE (NOWOŚĆ) ----
-        try:
-            if HAS_PIL:
-                image_data = resize_image(image_data)
-            else:
-                # Jeśli brak Pillow, spróbuj wysłać oryginał (może się nie udać)
-                log.warning("Pillow not installed – skipping resize, may fail if image too large.")
-        except Exception as e:
-            log.exception("Resize failed")
-            await send_reply(channel_id, msg_id, f"błąd podczas skalowania obrazu: {str(e)[:100]}")
-            return
-
-        success, message = await change_avatar(image_data)
-        if success:
-            await send_reply(channel_id, msg_id, message)
-        else:
-            await send_reply(channel_id, msg_id, f"nie udało się zmienić avatara: {message}")
-        return
-
     # -------------------- DISPLAY NAME CHANGE --------------------
     if cmd == ".display":
         if len(parts) < 2:
@@ -672,9 +545,8 @@ async def handle_command(msg):
             await send_reply(channel_id, msg_id, f"nie udało się zmienić display name: {message}")
         return
 
-    # -------------------- IGNORE / UNIGNORE (NEW) --------------------
+    # -------------------- IGNORE / UNIGNORE --------------------
     if cmd == ".ignore":
-        # Only owners can use this command
         author_id = str(msg["author"]["id"])
         if author_id not in OWNER_IDS:
             await send_reply(channel_id, msg_id, "nie masz uprawnień do tej komendy")
@@ -686,9 +558,7 @@ async def handle_command(msg):
         if not target.isdigit():
             await send_reply(channel_id, msg_id, "id musi być liczbą")
             return
-        # Add permanent ignore (expiry = 0)
         ignored_users[target] = 0
-        # Also clear any mention timestamps
         mention_timestamps.pop(target, None)
         log.info(f"Manually ignored user {target}")
         await send_reply(channel_id, msg_id, f"użytkownik {target} został zignorowany na stałe")
@@ -732,16 +602,14 @@ async def handle_command(msg):
         await send_reply(channel_id, msg_id, "\n".join(lines))
         return
 
-    # -------------------- NOWA KOMENDA: .server --------------------
+    # -------------------- SERVER JOIN + ONBOARDING --------------------
     if cmd == ".server":
         if len(parts) < 2:
             await send_reply(channel_id, msg_id, "użycie: .server <kod_zaproszenia>")
             return
         invite_code = parts[1].strip()
-        # Oczyszczamy z ewentualnego pełnego URL
         if '/' in invite_code:
             invite_code = invite_code.split('/')[-1]
-        # Dołącz do serwera
         url = f"https://discord.com/api/v9/invites/{invite_code}"
         resp = await api_request("POST", url)
         if resp.status_code != 200:
@@ -754,7 +622,6 @@ async def handle_command(msg):
             return
         await send_reply(channel_id, msg_id, f"dołączono do serwera {guild_id}, teraz przechodzę onboarding...")
 
-        # Pobierz formularz onboardingu
         verif_url = f"https://discord.com/api/v9/guilds/{guild_id}/member-verification"
         verif_resp = await api_request("GET", verif_url)
         if verif_resp.status_code != 200:
@@ -767,7 +634,6 @@ async def handle_command(msg):
             await send_reply(channel_id, msg_id, "brak pól onboardingu – prawdopodobnie już ukończony")
             return
 
-        # Przygotuj odpowiedzi
         answers = []
         for field in form_fields:
             field_id = field.get("field_id")
@@ -781,21 +647,17 @@ async def handle_command(msg):
                 choices = field.get("choices", [])
                 max_choices = field.get("max_choices", 1)
                 if choices:
-                    # Wybierz losowo od 1 do max_choices (ale nie więcej niż dostępne)
                     num = random.randint(1, min(max_choices, len(choices)))
                     selected = random.sample(choices, k=num)
                     answer["value"] = [ch.get("value") for ch in selected]
                 else:
                     answer["value"] = []
             elif field_type == "TEXT_INPUT":
-                # Wpisz losowy tekst
                 answer["value"] = "losowa odpowiedź"
             else:
-                # Pomijamy nieznane typy
                 continue
             answers.append(answer)
 
-        # Wyślij odpowiedzi
         submit_payload = {
             "version": version,
             "form_answers": answers
@@ -909,11 +771,10 @@ async def handle_message(msg):
     content = msg.get("content", "")
     author_id = str(msg["author"]["id"])
     is_bot = msg.get("author", {}).get("bot", False)
-    
+
     if is_bot:
         return
 
-    # --- Check if user is ignored ---
     if is_ignored(author_id):
         log.debug(f"Ignoring message from ignored user {author_id}")
         return
@@ -936,24 +797,21 @@ async def handle_message(msg):
         ref = msg["referenced_message"]
         if ref.get("author", {}).get("id") == self_user_id:
             replied = True
-    
+
     channel_type = msg.get("channel_type")
     is_dm = channel_type in ("DM", "GROUP_DM")
-    
+
     if not (mentioned or replied or is_dm):
         return
 
-    # --- Spam detection (auto-ignore) ---
     if check_mention_spam(author_id):
-        # User is now ignored; we drop this message and any future ones
         log.info(f"User {author_id} auto-ignored due to spam, dropping this message")
         return
 
-    # Wysyłamy sygnał pisania, ale bez zbędnych sleepów
     await send_typing(channel_id)
-    
+
     context = await build_context(channel_id, msg, guild_id)
-    
+
     author_name = msg["author"].get("global_name") or msg["author"]["username"]
     timestamp = time.time()
     if guild_id:
@@ -962,25 +820,17 @@ async def handle_message(msg):
         add_to_guild_history(f"dm_{channel_id}", author_name, msg["content"], msg_id, timestamp)
 
     try:
-        reply = model.generate_content(f"Kontekst:\n{context}\n\nOdpowiedz na ostatnią wiadomość.")
-        if not reply.candidates:
-            feedback = reply.prompt_feedback
-            block_reason = feedback.block_reason if feedback else "unknown"
-            log.warning(f"Gemini blocked content. Reason: {block_reason} - skipping reply.")
-            return
-        reply_text = (reply.text or "").strip()
+        reply_text = await deepseek_chat(f"Kontekst:\n{context}\n\nOdpowiedz na ostatnią wiadomość.")
         if not reply_text:
-            log.info("Gemini returned empty response - skipping reply.")
+            log.info("DeepSeek returned empty response - skipping reply.")
             return
-    except Exception as e:
-        log.exception("AI failed - skipping reply.")
+    except Exception:
+        log.exception("DeepSeek request failed - skipping reply.")
         return
 
-    # Wysyłamy odpowiedź od razu – bez dodatkowego czekania
     for i in range(0, len(reply_text), 1900):
         chunk = reply_text[i:i+1900]
         await send_reply(channel_id, msg_id, chunk)
-        # Krótkie opóźnienie między fragmentami, aby uniknąć floodu
         if i + 1900 < len(reply_text):
             await asyncio.sleep(CHUNK_DELAY)
 
@@ -992,15 +842,14 @@ async def filter_and_queue(msg):
     author_id = str(msg["author"]["id"])
     content = msg.get("content", "")
     is_bot = msg.get("author", {}).get("bot", False)
-    
+
     channel_id = msg.get("channel_id")
     if channel_id and not is_bot:
         active_channels.add(channel_id)
-    
+
     if is_bot:
         return
 
-    # --- If ignored, drop immediately ---
     if is_ignored(author_id):
         log.debug(f"Dropping message from ignored user {author_id}")
         return
@@ -1016,14 +865,14 @@ async def filter_and_queue(msg):
         log.info(f"DM from {msg['author']['username']} -> queue")
         await message_queue.put(msg)
         return
-    
+
     mentioned = any(m["id"] == self_user_id for m in msg.get("mentions", []))
     replied = False
     if msg.get("referenced_message"):
         ref = msg["referenced_message"]
         if ref.get("author", {}).get("id") == self_user_id:
             replied = True
-    
+
     if mentioned or replied:
         log.info(f"Message (mention/reply) from {msg['author']['username']} -> queue")
         await message_queue.put(msg)
@@ -1076,11 +925,11 @@ async def voice_keepalive():
 # --------------------------------------------
 async def listen():
     global self_user_id, session_id, resume_gateway_url, last_seq, current_ws
-    
+
     gw = (await api_request("GET", "https://discord.com/api/v9/gateway")).json()["url"]
     ws_url = resume_gateway_url if (resume_gateway_url and session_id) else f"{gw}/?v=9&encoding=json"
     log.info(f"Connecting to {ws_url}")
-    
+
     async with websockets.connect(ws_url) as ws:
         current_ws = ws
         hello = json.loads(await ws.recv())
@@ -1088,7 +937,7 @@ async def listen():
             raise RuntimeError("No Hello")
         interval = hello["d"]["heartbeat_interval"]
         asyncio.create_task(heartbeat(ws, interval))
-        
+
         if session_id and resume_gateway_url:
             await ws.send(json.dumps({
                 "op": 6,
@@ -1117,17 +966,17 @@ async def listen():
                 }
             }))
             log.info("Identify sent (no intents)")
-        
+
         keepalive_task = asyncio.create_task(voice_keepalive())
         spontaneous_task = asyncio.create_task(spontaneous_loop())
         await restore_voice_channels()
-        
+
         while True:
             try:
                 raw = await ws.recv()
                 payload = json.loads(raw)
                 op = payload.get("op")
-                
+
                 if op == 0:
                     t = payload.get("t")
                     d = payload.get("d", {})
@@ -1141,7 +990,7 @@ async def listen():
                         await filter_and_queue(d)
                     if payload.get("s"):
                         last_seq = payload["s"]
-                
+
                 elif op == 7:
                     log.warning("Reconnect requested")
                     break
@@ -1155,9 +1004,9 @@ async def listen():
             except websockets.exceptions.ConnectionClosed as e:
                 log.error(f"Closed: {e}")
                 break
-            except Exception as e:
+            except Exception:
                 log.exception("Loop error")
-        
+
         keepalive_task.cancel()
         spontaneous_task.cancel()
 
@@ -1169,7 +1018,7 @@ async def heartbeat(ws, interval):
         await asyncio.sleep(interval / 1000.0)
         try:
             await ws.send(json.dumps({"op": 1, "d": None}))
-        except:
+        except Exception:
             break
 
 # --------------------------------------------
@@ -1183,17 +1032,15 @@ async def main():
         return
     self_user_id = str(resp.json()["id"])
     log.info(f"Token valid. ID: {self_user_id}")
-    
+
     asyncio.create_task(rate_limiter())
     asyncio.create_task(process_worker())
-    # Można dodać drugiego worker'a dla większej przepustowości (opcjonalnie)
-    # asyncio.create_task(process_worker())
-    
+
     backoff = 2
     while True:
         try:
             await listen()
-        except Exception as e:
+        except Exception:
             log.exception("Crashed")
         log.info(f"Reconnecting in {backoff}s...")
         await asyncio.sleep(backoff)
