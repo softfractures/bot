@@ -16,9 +16,9 @@ load_dotenv()
 # CONFIGURATION
 # --------------------------------------------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
-DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
-DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-chat")
+OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 # Multiple owners
 OWNER_IDS = [
@@ -43,7 +43,7 @@ MAX_HISTORY_PER_GUILD = 50
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("stealth-selfbot")
 
-if not DISCORD_TOKEN or not DEEPSEEK_API_KEY:
+if not DISCORD_TOKEN or not OPENROUTER_API_KEY:
     raise RuntimeError("Missing credentials in .env")
 
 # --------------------------------------------
@@ -71,7 +71,7 @@ def fetch_latest_build_info():
 LATEST_BUILD, LATEST_VERSION = fetch_latest_build_info()
 
 # --------------------------------------------
-# DEEPSEEK SETUP
+# AI SETUP (OpenRouter -> DeepSeek)
 # --------------------------------------------
 DEFAULT_SYSTEM_PROMPT = (
 "jesteś wulgarnym agresywnym botem discord"
@@ -91,13 +91,13 @@ DEFAULT_SYSTEM_PROMPT = (
 current_system_prompt = DEFAULT_SYSTEM_PROMPT
 
 # --------------------------------------------
-# DEEPSEEK CHAT REQUEST
+# AI CHAT REQUEST (OpenRouter, OpenAI-compatible)
 # --------------------------------------------
 async def deepseek_chat(user_content: str, system_prompt: str = None) -> str:
-    """Send a chat request to DeepSeek and return the assistant text."""
+    """Send a chat request to OpenRouter (DeepSeek model) and return the assistant text."""
     sys_prompt = system_prompt if system_prompt is not None else current_system_prompt
     payload = {
-        "model": DEEPSEEK_MODEL,
+        "model": OPENROUTER_MODEL,
         "messages": [
             {"role": "system", "content": sys_prompt},
             {"role": "user", "content": user_content},
@@ -107,19 +107,21 @@ async def deepseek_chat(user_content: str, system_prompt: str = None) -> str:
         "max_tokens": 300,
     }
     headers = {
-        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
+        "HTTP-Referer": "https://github.com/your-repo",  # optional, recommended by OpenRouter
+        "X-Title": "Discord Selfbot",                     # optional
     }
     async with aiohttp.ClientSession() as sess:
-        async with sess.post(DEEPSEEK_API_URL, json=payload, headers=headers) as resp:
+        async with sess.post(OPENROUTER_API_URL, json=payload, headers=headers) as resp:
             if resp.status != 200:
                 text = await resp.text()
-                raise RuntimeError(f"DeepSeek error {resp.status}: {text[:300]}")
+                raise RuntimeError(f"OpenRouter error {resp.status}: {text[:300]}")
             data = await resp.json()
     try:
         return (data["choices"][0]["message"]["content"] or "").strip()
     except (KeyError, IndexError) as e:
-        raise RuntimeError(f"Unexpected DeepSeek response: {data}") from e
+        raise RuntimeError(f"Unexpected OpenRouter response: {data}") from e
 
 # --------------------------------------------
 # DYNAMIC HEADER GENERATION
@@ -250,7 +252,7 @@ def check_mention_spam(user_id):
     return False
 
 # --------------------------------------------
-# PER‑SERVER HISTORY HELPERS
+# PER-SERVER HISTORY HELPERS
 # --------------------------------------------
 def add_to_guild_history(key, author_name, content, msg_id, timestamp):
     if key not in guild_histories:
@@ -822,10 +824,10 @@ async def handle_message(msg):
     try:
         reply_text = await deepseek_chat(f"Kontekst:\n{context}\n\nOdpowiedz na ostatnią wiadomość.")
         if not reply_text:
-            log.info("DeepSeek returned empty response - skipping reply.")
+            log.info("AI returned empty response - skipping reply.")
             return
     except Exception:
-        log.exception("DeepSeek request failed - skipping reply.")
+        log.exception("AI request failed - skipping reply.")
         return
 
     for i in range(0, len(reply_text), 1900):
