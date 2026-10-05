@@ -49,7 +49,10 @@ if not DISCORD_TOKEN or not OPENROUTER_API_KEY:
 # --------------------------------------------
 # FETCH LATEST DISCORD BUILD INFO
 # --------------------------------------------
+_BUILD_INFO_WARNED = False
+
 def fetch_latest_build_info():
+    global _BUILD_INFO_WARNED
     try:
         url = "https://raw.githubusercontent.com/qoft/discord-api/main/fetch"
         response = requests.get(url, timeout=10, impersonate="chrome120")
@@ -61,12 +64,11 @@ def fetch_latest_build_info():
         if build_number and version:
             log.info(f"Fetched latest build: {build_number} (v{version})")
             return build_number, version
-        else:
-            log.warning("Could not parse build info, using fallback.")
-            return 238248, "1.0.9037"
     except Exception as e:
-        log.error(f"Failed to fetch build info: {e}. Using fallback.")
-        return 238248, "1.0.9037"
+        if not _BUILD_INFO_WARNED:
+            log.warning(f"Build info fetch failed ({e}); using fallback.")
+            _BUILD_INFO_WARNED = True
+    return 238248, "1.0.9037"
 
 LATEST_BUILD, LATEST_VERSION = fetch_latest_build_info()
 
@@ -172,16 +174,31 @@ session = requests.Session()
 session.impersonate = "chrome120"
 
 async def api_request(method, url, **kwargs):
+    attempts = 0
     while True:
+        attempts += 1
         headers = get_dynamic_headers()
         if 'headers' in kwargs:
             headers.update(kwargs.pop('headers'))
         resp = await asyncio.to_thread(session.request, method, url, headers=headers, **kwargs)
+
         if resp.status_code == 429:
-            retry = resp.json().get('retry_after', 2)
-            log.warning(f"Rate limited. Sleeping {retry}s")
+            retry = 2.0
+            try:
+                body = resp.json()
+                retry = float(body.get('retry_after', 2))
+            except Exception:
+                snippet = (resp.text or "")[:200].replace("\n", " ")
+                log.warning(f"429 with non-JSON body: {snippet!r}")
+
+            if attempts > 5:
+                log.error(f"Too many 429s on {url}, giving up")
+                return resp
+
+            log.warning(f"Rate limited. Sleeping {retry}s (attempt {attempts})")
             await asyncio.sleep(retry + 0.5)
             continue
+
         return resp
 
 # --------------------------------------------
@@ -1049,8 +1066,12 @@ async def heartbeat(ws, interval):
 async def main():
     global self_user_id
     resp = await api_request("GET", "https://discord.com/api/v9/users/@me")
+    if resp.status_code == 429:
+        log.error("Rate limited on startup. Waiting 30s and retrying...")
+        await asyncio.sleep(30)
+        resp = await api_request("GET", "https://discord.com/api/v9/users/@me")
     if resp.status_code != 200:
-        log.error("Token invalid! Get a fresh one.")
+        log.error(f"Cannot authenticate (status {resp.status_code}): {resp.text[:200]!r}")
         return
     self_user_id = str(resp.json()["id"])
     log.info(f"Token valid. ID: {self_user_id}")
