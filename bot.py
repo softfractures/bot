@@ -213,14 +213,17 @@ async def send_reply(channel_id, reply_to_id, content):
     payload = {
         "content": content,
         "message_reference": {"message_id": reply_to_id},
-        "allowed_mentions": {"replied_user": True}
+        "allowed_mentions": {"parse": ["users", "roles", "everyone"], "replied_user": True}
     }
     resp = await api_request("POST", url, json=payload)
     return resp.status_code == 200
 
 async def send_message(channel_id, content):
     url = f"https://discord.com/api/v9/channels/{channel_id}/messages"
-    payload = {"content": content}
+    payload = {
+        "content": content,
+        "allowed_mentions": {"parse": ["users", "roles", "everyone"]}
+    }
     resp = await api_request("POST", url, json=payload)
     return resp.status_code == 200
 
@@ -932,7 +935,17 @@ async def listen():
                         "$browser_version": "120.0.6099.216"
                     },
                     "large_threshold": 250,
-                    "compress": False
+                    "compress": False,
+                    "capabilities": 125,
+                    "client_state": {
+                        "guild_versions": {},
+                        "highest_last_message_id": "0",
+                        "read_state_version": 0,
+                        "user_guild_settings_version": -1,
+                        "user_settings_version": -1,
+                        "private_channels_version": "0",
+                        "api_code_version": 0
+                    }
                 }
             }))
             log.info("Identify sent (no intents)")
@@ -956,12 +969,17 @@ async def listen():
                         log.info(f"Logged in as {d['user']['username']} (ID: {self_user_id})")
                         await restore_voice_channels()
                     elif t == "MESSAGE_CREATE":
-                        await filter_and_queue(d)
-                    elif t == "GUILD_MEMBER_ADD":
-                        user = d.get("user", {})
-                        uid = user.get("id")
-                        if uid and str(uid) != self_user_id:
-                            asyncio.create_task(send_welcome(str(uid)))
+                        # Type 7 = "guild member joined" system message
+                        if d.get("type") == 7:
+                            join_user = d.get("author", {})
+                            uid = join_user.get("id")
+                            if uid and str(uid) != self_user_id:
+                                log.info(f"Member join detected: {uid} ({join_user.get('username')})")
+                                asyncio.create_task(send_welcome(str(uid)))
+                            else:
+                                log.debug(f"Join system message but skipped (uid={uid})")
+                        else:
+                            await filter_and_queue(d)
                     if payload.get("s"):
                         last_seq = payload["s"]
 
