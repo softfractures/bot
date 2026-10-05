@@ -26,11 +26,12 @@ OWNER_IDS = [
     "1505100446891773962"
 ]
 
-# Spontaneous messages settings
-SPONTANEOUS_CHANCE = 0.03
-SPONTANEOUS_COOLDOWN = 180
-SPONTANEOUS_CHECK_INTERVAL = 60
-SPONTANEOUS_CHANNEL_ID = "1458080496369139849"
+# Welcome message on member join
+WELCOME_CHANNEL_ID = "1458080496369139849"
+WELCOME_MESSAGES = [
+    "siema pizdo {mention} 🤡",
+    "siema piesku {mention}",
+]
 
 # Faster delays
 MIN_REPLY_DELAY = 0.5
@@ -235,7 +236,6 @@ last_message_time = 0
 current_ws = None
 voice_channels = {}
 persistent_voice_channels = {}
-last_spontaneous_time = 0
 active_channels = set()
 
 guild_histories = {}
@@ -342,85 +342,16 @@ async def build_context(channel_id, current_msg, guild_id=None):
     return "\n".join(lines)
 
 # --------------------------------------------
-# SPONTANEOUS MESSAGES
+# WELCOME ON MEMBER JOIN
 # --------------------------------------------
-SPONTANEOUS_PROMPTS = [
-    "napisz krotka bezczelna wiadomosc do uzytkownika {username} w stylu znudzonego sarkastycznego discordowicza. odnies sie do tego ze nic nie pisze. max 1 zdanie, bez emotek.",
-    "zaczep uzytkownika {username} w jednym krotkim sarkastycznym zdaniu. wykpij go za to ze sie nie odzywa. bez emotek.",
-    "napisz co myslisz o uzytkowniku {username} - tylko bezczelnie i krotko, jakby ci sie nie chcialo nawet obrazac. max 1-2 zdania.",
-    "wytknij uzytkownikowi {username} ze siedzi cicho i nic nie wnosi. jedno zdanie, sarkastycznie, bez emotek.",
-    "powiedz cos zlośliwego ale konkretnego o uzytkowniku {username} ktory nic nie napisal - wykpij to. max 2 zdania."
-]
-
-async def send_spontaneous_message():
-    global last_spontaneous_time
-
-    channel_id = SPONTANEOUS_CHANNEL_ID
-    if not channel_id:
-        log.warning("No spontaneous channel ID set, skipping.")
-        return
-
-    now = time.time()
-    if now - last_spontaneous_time < SPONTANEOUS_COOLDOWN:
-        return
-
-    if random.random() > SPONTANEOUS_CHANCE:
-        return
-
-    target_user_id = None
-    target_display_name = None
+async def send_welcome(user_id):
+    mention = f"<@{user_id}>"
+    msg = random.choice(WELCOME_MESSAGES).format(mention=mention)
     try:
-        url = f"https://discord.com/api/v9/channels/{channel_id}/messages?limit=20"
-        headers = get_dynamic_headers()
-        resp = await asyncio.to_thread(session.get, url, headers=headers)
-        if resp.status_code == 200:
-            msgs = resp.json()
-            users = []
-            for m in msgs:
-                if m["author"]["id"] == self_user_id:
-                    continue
-                if m["author"].get("bot", False):
-                    continue
-                display_name = m["author"].get("global_name") or m["author"].get("username", "user")
-                users.append((m["author"]["id"], display_name))
-            if users:
-                target_user_id, target_display_name = random.choice(users)
-    except Exception as e:
-        log.warning(f"Failed to fetch users for spontaneous message: {e}")
-
-    if not target_user_id:
-        log.info("No users found, using generic message")
-        try:
-            prompt = random.choice(["napisz krotka bezczelna wiadomosc bez powodu, jak znudzony discordowicz. max 1 zdanie, bez emotek."])
-            msg = await deepseek_chat(prompt)
-            if msg:
-                await send_typing(channel_id)
-                await asyncio.sleep(0.5)
-                await send_message(channel_id, msg)
-                last_spontaneous_time = now
-        except Exception:
-            log.exception("Failed to send generic spontaneous message")
-        return
-
-    try:
-        prompt_template = random.choice(SPONTANEOUS_PROMPTS)
-        prompt = prompt_template.format(username=target_display_name)
-        insult = await deepseek_chat(prompt)
-        if not insult:
-            return
-        final_msg = f"{insult} <@{target_user_id}>"
-        log.info(f"Sending spontaneous insult to {target_display_name} in {channel_id}: {final_msg}")
-        await send_typing(channel_id)
-        await asyncio.sleep(0.5)
-        await send_message(channel_id, final_msg)
-        last_spontaneous_time = now
+        ok = await send_message(WELCOME_CHANNEL_ID, msg)
+        log.info(f"Welcome sent for {user_id} in {WELCOME_CHANNEL_ID} (ok={ok}): {msg}")
     except Exception:
-        log.exception("Failed to generate/send spontaneous insult")
-
-async def spontaneous_loop():
-    while True:
-        await asyncio.sleep(SPONTANEOUS_CHECK_INTERVAL)
-        await send_spontaneous_message()
+        log.exception("Failed to send welcome message")
 
 # --------------------------------------------
 # PROMPT MANAGEMENT
@@ -1007,7 +938,6 @@ async def listen():
             log.info("Identify sent (no intents)")
 
         keepalive_task = asyncio.create_task(voice_keepalive())
-        spontaneous_task = asyncio.create_task(spontaneous_loop())
         await restore_voice_channels()
 
         while True:
@@ -1027,6 +957,11 @@ async def listen():
                         await restore_voice_channels()
                     elif t == "MESSAGE_CREATE":
                         await filter_and_queue(d)
+                    elif t == "GUILD_MEMBER_ADD":
+                        user = d.get("user", {})
+                        uid = user.get("id")
+                        if uid and str(uid) != self_user_id:
+                            asyncio.create_task(send_welcome(str(uid)))
                     if payload.get("s"):
                         last_seq = payload["s"]
 
@@ -1047,7 +982,6 @@ async def listen():
                 log.exception("Loop error")
 
         keepalive_task.cancel()
-        spontaneous_task.cancel()
 
 # --------------------------------------------
 # HEARTBEAT
