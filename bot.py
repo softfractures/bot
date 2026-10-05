@@ -26,12 +26,11 @@ OWNER_IDS = [
     "1505100446891773962"
 ]
 
-# Welcome message on member join
-WELCOME_CHANNEL_ID = "1458080496369139849"
-WELCOME_MESSAGES = [
-    "siema pizdo {mention} 🤡",
-    "siema piesku {mention}",
-]
+# Spontaneous messages settings
+SPONTANEOUS_CHANCE = 0.03
+SPONTANEOUS_COOLDOWN = 180
+SPONTANEOUS_CHECK_INTERVAL = 60
+SPONTANEOUS_CHANNEL_ID = "1458080496369139849"
 
 # Faster delays
 MIN_REPLY_DELAY = 0.5
@@ -50,10 +49,7 @@ if not DISCORD_TOKEN or not OPENROUTER_API_KEY:
 # --------------------------------------------
 # FETCH LATEST DISCORD BUILD INFO
 # --------------------------------------------
-_BUILD_INFO_WARNED = False
-
 def fetch_latest_build_info():
-    global _BUILD_INFO_WARNED
     try:
         url = "https://raw.githubusercontent.com/qoft/discord-api/main/fetch"
         response = requests.get(url, timeout=10, impersonate="chrome120")
@@ -65,11 +61,12 @@ def fetch_latest_build_info():
         if build_number and version:
             log.info(f"Fetched latest build: {build_number} (v{version})")
             return build_number, version
+        else:
+            log.warning("Could not parse build info, using fallback.")
+            return 238248, "1.0.9037"
     except Exception as e:
-        if not _BUILD_INFO_WARNED:
-            log.warning(f"Build info fetch failed ({e}); using fallback.")
-            _BUILD_INFO_WARNED = True
-    return 238248, "1.0.9037"
+        log.error(f"Failed to fetch build info: {e}. Using fallback.")
+        return 238248, "1.0.9037"
 
 LATEST_BUILD, LATEST_VERSION = fetch_latest_build_info()
 
@@ -89,14 +86,15 @@ DEFAULT_SYSTEM_PROMPT = (
     "nigdy nie zaczynaj od 'a kto pytal' 'spierdalaj' 'zamknij sie' - to sa zakazane otwarcia\n"
     "NIGDY nie wspominaj o tym ze ktos cie pingnal, ze dostales pinga, ze ktos cie wolal, "
     "ze ktos sie do ciebie zwraca - ping jest normalny i oczywisty, nie komentuj tego\n"
+    "nie uzywaj cudzyslowow na poczatku ani na koncu odpowiedzi - pisz jak normalna wiadomosc na czacie\n"
     "nie tlumacz sie nie przepraszaj\n"
     "\n"
     "przyklady dobrego stylu (kazdy odnosi sie do konkretu):\n"
-    "- ktos pisze 'elo' -> 'elo to twoja stara mowi jak wraca z roboty'\n"
-    "- ktos pisze 'co tam' -> 'nic tam, twoja stara sie nudzi wiec moze do niej wpadnij'\n"
-    "- ktos pisze glupote -> 'przeczytaj to co wlasnie napisales, na glos, powoli'\n"
-    "- ktos sie madrzy -> 'no jasne ze wiesz lepiej, jak zawsze'\n"
-    "- ktos pisze 'xddd' -> 'xddd to twoja jedyna reakcja bo wiecej nie umiesz wymyslec'\n"
+    "- ktos pisze elo -> elo to twoja stara mowi jak wraca z roboty\n"
+    "- ktos pisze co tam -> nic tam, twoja stara sie nudzi wiec moze do niej wpadnij\n"
+    "- ktos pisze glupote -> przeczytaj to co wlasnie napisales, na glos, powoli\n"
+    "- ktos sie madrzy -> no jasne ze wiesz lepiej, jak zawsze\n"
+    "- ktos pisze xddd -> xddd to twoja jedyna reakcja bo wiecej nie umiesz wymyslec\n"
 )
 
 current_system_prompt = DEFAULT_SYSTEM_PROMPT
@@ -133,6 +131,21 @@ async def deepseek_chat(user_content: str, system_prompt: str = None) -> str:
         return (data["choices"][0]["message"]["content"] or "").strip()
     except (KeyError, IndexError) as e:
         raise RuntimeError(f"Unexpected OpenRouter response: {data}") from e
+
+# --------------------------------------------
+# STRIP WRAPPING QUOTES
+# --------------------------------------------
+def strip_wrapping_quotes(text: str) -> str:
+    """Remove one layer of wrapping quotes the model sometimes adds."""
+    if not text:
+        return text
+    t = text.strip()
+    pairs = [('"', '"'), ("'", "'"), ("„", "”"), ("「", "」"), ("«", "»")]
+    for open_q, close_q in pairs:
+        if len(t) >= 2 and t.startswith(open_q) and t.endswith(close_q):
+            t = t[1:-1].strip()
+            break
+    return t
 
 # --------------------------------------------
 # DYNAMIC HEADER GENERATION
@@ -175,31 +188,16 @@ session = requests.Session()
 session.impersonate = "chrome120"
 
 async def api_request(method, url, **kwargs):
-    attempts = 0
     while True:
-        attempts += 1
         headers = get_dynamic_headers()
         if 'headers' in kwargs:
             headers.update(kwargs.pop('headers'))
         resp = await asyncio.to_thread(session.request, method, url, headers=headers, **kwargs)
-
         if resp.status_code == 429:
-            retry = 2.0
-            try:
-                body = resp.json()
-                retry = float(body.get('retry_after', 2))
-            except Exception:
-                snippet = (resp.text or "")[:200].replace("\n", " ")
-                log.warning(f"429 with non-JSON body: {snippet!r}")
-
-            if attempts > 5:
-                log.error(f"Too many 429s on {url}, giving up")
-                return resp
-
-            log.warning(f"Rate limited. Sleeping {retry}s (attempt {attempts})")
+            retry = resp.json().get('retry_after', 2)
+            log.warning(f"Rate limited. Sleeping {retry}s")
             await asyncio.sleep(retry + 0.5)
             continue
-
         return resp
 
 # --------------------------------------------
@@ -213,17 +211,14 @@ async def send_reply(channel_id, reply_to_id, content):
     payload = {
         "content": content,
         "message_reference": {"message_id": reply_to_id},
-        "allowed_mentions": {"parse": ["users", "roles", "everyone"], "replied_user": True}
+        "allowed_mentions": {"replied_user": True}
     }
     resp = await api_request("POST", url, json=payload)
     return resp.status_code == 200
 
 async def send_message(channel_id, content):
     url = f"https://discord.com/api/v9/channels/{channel_id}/messages"
-    payload = {
-        "content": content,
-        "allowed_mentions": {"parse": ["users", "roles", "everyone"]}
-    }
+    payload = {"content": content}
     resp = await api_request("POST", url, json=payload)
     return resp.status_code == 200
 
@@ -239,6 +234,7 @@ last_message_time = 0
 current_ws = None
 voice_channels = {}
 persistent_voice_channels = {}
+last_spontaneous_time = 0
 active_channels = set()
 
 guild_histories = {}
@@ -345,16 +341,87 @@ async def build_context(channel_id, current_msg, guild_id=None):
     return "\n".join(lines)
 
 # --------------------------------------------
-# WELCOME ON MEMBER JOIN
+# SPONTANEOUS MESSAGES
 # --------------------------------------------
-async def send_welcome(user_id):
-    mention = f"<@{user_id}>"
-    msg = random.choice(WELCOME_MESSAGES).format(mention=mention)
+SPONTANEOUS_PROMPTS = [
+    "napisz krotka bezczelna wiadomosc do uzytkownika {username} w stylu znudzonego sarkastycznego discordowicza. odnies sie do tego ze nic nie pisze. max 1 zdanie, bez emotek.",
+    "zaczep uzytkownika {username} w jednym krotkim sarkastycznym zdaniu. wykpij go za to ze sie nie odzywa. bez emotek.",
+    "napisz co myslisz o uzytkowniku {username} - tylko bezczelnie i krotko, jakby ci sie nie chcialo nawet obrazac. max 1-2 zdania.",
+    "wytknij uzytkownikowi {username} ze siedzi cicho i nic nie wnosi. jedno zdanie, sarkastycznie, bez emotek.",
+    "powiedz cos zlośliwego ale konkretnego o uzytkowniku {username} ktory nic nie napisal - wykpij to. max 2 zdania."
+]
+
+async def send_spontaneous_message():
+    global last_spontaneous_time
+
+    channel_id = SPONTANEOUS_CHANNEL_ID
+    if not channel_id:
+        log.warning("No spontaneous channel ID set, skipping.")
+        return
+
+    now = time.time()
+    if now - last_spontaneous_time < SPONTANEOUS_COOLDOWN:
+        return
+
+    if random.random() > SPONTANEOUS_CHANCE:
+        return
+
+    target_user_id = None
+    target_display_name = None
     try:
-        ok = await send_message(WELCOME_CHANNEL_ID, msg)
-        log.info(f"Welcome sent for {user_id} in {WELCOME_CHANNEL_ID} (ok={ok}): {msg}")
+        url = f"https://discord.com/api/v9/channels/{channel_id}/messages?limit=20"
+        headers = get_dynamic_headers()
+        resp = await asyncio.to_thread(session.get, url, headers=headers)
+        if resp.status_code == 200:
+            msgs = resp.json()
+            users = []
+            for m in msgs:
+                if m["author"]["id"] == self_user_id:
+                    continue
+                if m["author"].get("bot", False):
+                    continue
+                display_name = m["author"].get("global_name") or m["author"].get("username", "user")
+                users.append((m["author"]["id"], display_name))
+            if users:
+                target_user_id, target_display_name = random.choice(users)
+    except Exception as e:
+        log.warning(f"Failed to fetch users for spontaneous message: {e}")
+
+    if not target_user_id:
+        log.info("No users found, using generic message")
+        try:
+            prompt = random.choice(["napisz krotka bezczelna wiadomosc bez powodu, jak znudzony discordowicz. max 1 zdanie, bez emotek."])
+            msg = await deepseek_chat(prompt)
+            if msg:
+                msg = strip_wrapping_quotes(msg)
+                await send_typing(channel_id)
+                await asyncio.sleep(0.5)
+                await send_message(channel_id, msg)
+                last_spontaneous_time = now
+        except Exception:
+            log.exception("Failed to send generic spontaneous message")
+        return
+
+    try:
+        prompt_template = random.choice(SPONTANEOUS_PROMPTS)
+        prompt = prompt_template.format(username=target_display_name)
+        insult = await deepseek_chat(prompt)
+        if not insult:
+            return
+        insult = strip_wrapping_quotes(insult)
+        final_msg = f"{insult} <@{target_user_id}>"
+        log.info(f"Sending spontaneous insult to {target_display_name} in {channel_id}: {final_msg}")
+        await send_typing(channel_id)
+        await asyncio.sleep(0.5)
+        await send_message(channel_id, final_msg)
+        last_spontaneous_time = now
     except Exception:
-        log.exception("Failed to send welcome message")
+        log.exception("Failed to generate/send spontaneous insult")
+
+async def spontaneous_loop():
+    while True:
+        await asyncio.sleep(SPONTANEOUS_CHECK_INTERVAL)
+        await send_spontaneous_message()
 
 # --------------------------------------------
 # PROMPT MANAGEMENT
@@ -781,10 +848,11 @@ async def handle_message(msg):
     else:
         add_to_guild_history(f"dm_{channel_id}", author_name, msg["content"], msg_id, timestamp)
 
+    # Clear, targeted prompt so the model knows exactly who/what to respond to
     prompt = (
         f"Ostatnie wiadomosci na kanale:\n{context}\n\n"
         f"Teraz odpowiedz KRÓTKO (max 1-2 zdania) na OSTATNIA wiadomosc od {author_name}, "
-        f"ktory napisal: \"{target_message}\".\n"
+        f"ktory napisal: {target_message}\n"
         f"Odnies sie konkretnie do TRESCI tego co napisal. "
         f"NIE wspominaj o pingowaniu, o tym ze cie wolal, ani o tym ze sie do ciebie zwraca - "
         f"to jest oczywiste, skup sie na tresci. "
@@ -797,6 +865,7 @@ async def handle_message(msg):
         if not reply_text:
             log.info("AI returned empty response - skipping reply.")
             return
+        reply_text = strip_wrapping_quotes(reply_text)
     except Exception:
         log.exception("AI request failed - skipping reply.")
         return
@@ -935,22 +1004,13 @@ async def listen():
                         "$browser_version": "120.0.6099.216"
                     },
                     "large_threshold": 250,
-                    "compress": False,
-                    "capabilities": 125,
-                    "client_state": {
-                        "guild_versions": {},
-                        "highest_last_message_id": "0",
-                        "read_state_version": 0,
-                        "user_guild_settings_version": -1,
-                        "user_settings_version": -1,
-                        "private_channels_version": "0",
-                        "api_code_version": 0
-                    }
+                    "compress": False
                 }
             }))
             log.info("Identify sent (no intents)")
 
         keepalive_task = asyncio.create_task(voice_keepalive())
+        spontaneous_task = asyncio.create_task(spontaneous_loop())
         await restore_voice_channels()
 
         while True:
@@ -969,17 +1029,7 @@ async def listen():
                         log.info(f"Logged in as {d['user']['username']} (ID: {self_user_id})")
                         await restore_voice_channels()
                     elif t == "MESSAGE_CREATE":
-                        # Type 7 = "guild member joined" system message
-                        if d.get("type") == 7:
-                            join_user = d.get("author", {})
-                            uid = join_user.get("id")
-                            if uid and str(uid) != self_user_id:
-                                log.info(f"Member join detected: {uid} ({join_user.get('username')})")
-                                asyncio.create_task(send_welcome(str(uid)))
-                            else:
-                                log.debug(f"Join system message but skipped (uid={uid})")
-                        else:
-                            await filter_and_queue(d)
+                        await filter_and_queue(d)
                     if payload.get("s"):
                         last_seq = payload["s"]
 
@@ -1000,6 +1050,7 @@ async def listen():
                 log.exception("Loop error")
 
         keepalive_task.cancel()
+        spontaneous_task.cancel()
 
 # --------------------------------------------
 # HEARTBEAT
@@ -1018,12 +1069,8 @@ async def heartbeat(ws, interval):
 async def main():
     global self_user_id
     resp = await api_request("GET", "https://discord.com/api/v9/users/@me")
-    if resp.status_code == 429:
-        log.error("Rate limited on startup. Waiting 30s and retrying...")
-        await asyncio.sleep(30)
-        resp = await api_request("GET", "https://discord.com/api/v9/users/@me")
     if resp.status_code != 200:
-        log.error(f"Cannot authenticate (status {resp.status_code}): {resp.text[:200]!r}")
+        log.error("Token invalid! Get a fresh one.")
         return
     self_user_id = str(resp.json()["id"])
     log.info(f"Token valid. ID: {self_user_id}")
